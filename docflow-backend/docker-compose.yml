@@ -3,6 +3,12 @@ services:
     build: .
     env_file:
       - .env
+    # Override the host-oriented DSNs from .env with the compose network's
+    # internal service hostnames/ports.
+    environment:
+      DATABASE_URL: postgresql+asyncpg://docflow:docflow@db:5432/docflow
+      APP_DATABASE_URL: postgresql+asyncpg://docflow_app:docflow_app_dev_only@db:5432/docflow
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     depends_on:

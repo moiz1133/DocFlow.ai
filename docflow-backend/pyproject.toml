@@ -10,6 +10,8 @@ dependencies = [
     "pydantic-settings>=2.5.0",
     "asyncpg>=0.30.0",
     "redis>=5.1.0",
+    "sqlalchemy[asyncio]>=2.0.35",
+    "alembic>=1.13.3",
 ]
 
 [dependency-groups]
@@ -45,10 +47,20 @@ select = [
     "SIM", # flake8-simplify
     "RUF", # ruff-specific rules
 ]
-ignore = []
+ignore = [
+    "UP042", # classic `str, Enum` mixin kept deliberately over StrEnum: its
+    # __str__ differs (StrEnum returns the raw value; the mixin returns
+    # "ClassName.member"), and nothing here relies on that distinction.
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic's own revision template uses typing.Sequence/Union and leaves
+# trailing whitespace in the header; keep migrations close to Alembic's
+# generated form rather than hand-polishing every revision.
+"alembic/versions/*.py" = ["E501", "UP035", "UP007", "I001", "W291"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -72,6 +84,10 @@ disallow_untyped_defs = false
 [[tool.mypy.overrides]]
 module = "asyncpg.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "alembic.versions.*"
+ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
