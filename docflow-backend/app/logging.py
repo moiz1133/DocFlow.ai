@@ -35,6 +35,13 @@ PHI_SENSITIVE_FIELDS = frozenset(
         "email",
         "phone",
         "address",
+        # Transcription content (Phase 4) — audio bytes and transcript
+        # text must never reach logs, only metadata like provider name,
+        # duration, or segment counts.
+        "full_text",
+        "segments",
+        "audio_bytes",
+        "audio_data",
         # Auth secrets — never PHI, but equally must never reach logs.
         "password",
         "hashed_password",
