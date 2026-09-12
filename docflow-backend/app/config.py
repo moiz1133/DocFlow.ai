@@ -23,7 +23,17 @@ class Settings(BaseSettings):
 
     SECRET_KEY: str
 
+    # Admin/migration DSN: owns the schema, runs Alembic. Must NOT be used
+    # for application queries — it is typically a superuser role in local
+    # dev (the Postgres image's bootstrap user), which bypasses Row-Level
+    # Security entirely.
     DATABASE_URL: str
+
+    # Application runtime DSN: the restricted, non-superuser, NOBYPASSRLS
+    # role that all request-scoped queries must use so tenant-isolation
+    # policies are actually enforced. See README for the role requirements.
+    APP_DATABASE_URL: str
+
     REDIS_URL: str
 
     # "synthetic": safe for dev/test with fake data. "real": requires a BAA'd
