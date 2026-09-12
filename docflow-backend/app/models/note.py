@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import Enum, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Enum, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -29,3 +29,12 @@ class Note(Base, UUIDPKMixin, TenantMixin, TimestampMixin):
         server_default=NoteStatus.draft.value,
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+
+    # Phase 6 — generation provenance. Nullable: a future manually-authored
+    # note (no generator involved) would legitimately have none of these.
+    # See app/notes/prompts/soap_primary_care_v1.py for what prompt_version
+    # tags, and app/services/note_service.py for degraded's meaning.
+    prompt_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")

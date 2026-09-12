@@ -17,8 +17,14 @@ Backend for DocFlow.ai, an ambient AI medical scribe.
   Phase 4 `Transcriber` interface to real sessions and persisting
   transcripts, with zero-retention audio handling and consent-gated
   retention. Ends at a stored transcript.
+- **Phase 6** (done): SOAP note generation — a vendor-agnostic
+  `NoteGenerator` interface (`app/notes/`) with a mock and an OpenAI
+  implementation, a conservative chatter-scrubbing pre-step, schema
+  validation with retry-then-degrade, and `POST /v1/sessions/{id}/note`
+  (`app/services/note_service.py`) wiring it to a Phase 5 transcript.
 
-Note generation and full business routes land in later phases.
+Full business routes (note editing/finalization, patient-facing views)
+land in later phases.
 
 ## Stack
 
@@ -28,7 +34,8 @@ Note generation and full business routes land in later phases.
 - Structured JSON logging with PHI + auth-secret redaction
 - SQLAlchemy 2.0 (async, `Mapped[]` style) + Alembic, asyncpg driver
 - PyJWT, argon2-cffi (password hashing), pyotp (TOTP/MFA)
-- OpenAI SDK (transcription vendor — isolated behind `app/transcription/`)
+- OpenAI SDK (transcription + note-generation vendor — isolated behind
+  `app/transcription/` and `app/notes/` respectively)
 - WebSockets (FastAPI/Starlette native) for live audio streaming
 - Ruff, mypy, pytest for dev tooling; `httpx-ws` for WS integration tests
 - Docker + docker-compose (app, PostgreSQL 16, Redis 7)
@@ -89,6 +96,10 @@ All configuration is environment-driven (`app/config.py`), loaded via
 - `MAX_SESSION_SECONDS` / `MAX_AUDIO_BYTES` / `WS_BUFFER_MAX_CHUNKS` /
   `TRANSCRIPT_RETENTION_DEFAULT` (`none` | `consented` | `always`): audio
   ingestion limits and retention policy — see "Audio ingestion" below.
+- `NOTE_GENERATOR_VENDOR` (`mock` | `openai`) / `OPENAI_NOTE_MODEL` /
+  `NOTE_MAX_RETRIES` / `NOTE_TIMEOUT_SECONDS` / `NOTE_SCRUB_ENABLED` /
+  `NOTE_PROMPT_VERSION` / `NOTE_TRACING_ENABLED` / `LANGFUSE_HOST`: SOAP
+  note generation — see "SOAP note generation" below.
 
 ## Auth
 
@@ -358,6 +369,112 @@ see migration `6243b19b618c`), and `transcript.created` are written via
 transcription also writes an audit entry (`action=update`,
 `metadata={"status": "error", "reason": <error code>}`) and sets the
 session to `error`.
+
+## SOAP note generation
+
+`app/notes/` is a vendor-agnostic SOAP note generation interface — the
+same isolation rule as `app/transcription/` applies: **nothing outside
+`app/notes/` may import or know about a vendor SDK**. Enforced the same
+three ways: `pyproject.toml`'s banned-api rule, the factory's lazy
+`openai` import, and `tests/test_transcription_isolation.py` (the shared
+full-tree AST scan, now allowlisting both `app/transcription/openai.py`
+and `app/notes/openai.py`) plus `tests/test_notes_isolation.py` (the
+notes-specific dynamic check). `app/services/note_service.py` and
+`app/api/notes.py` (`POST /v1/sessions/{id}/note`) wire it to a Phase 5
+transcript. Specialty is locked to Primary Care, format to SOAP.
+
+### The interface (`app/notes/base.py`)
+
+- `NoteGenerator.generate_soap(transcript_text, context) -> SoapNote` —
+  the only method. `NoteContext` carries `specialty` (`"primary_care"`
+  only, for now), `language`, and an unused `clinician_preferences`
+  placeholder for a later phase.
+- `SoapNote` (`subjective`, `objective`, `assessment`, `plan`, `full_text`,
+  `provider`, `model`) is strict by construction: every section is
+  required and non-empty, `extra="forbid"` rejects stray fields, and
+  `SoapNote.compose(...)` is the one place `full_text` gets built from
+  the four sections, so every implementation composes it identically.
+  This validates the *shape a generator returns* — not a vendor's raw
+  response; `app/notes/openai.py`'s `_RawSoapOutput` validates that
+  separately, before it's ever allowed to become a `SoapNote` (see
+  "Retry-then-degrade" below).
+- Typed exceptions — `NoteGenerationError` (base), `NoteAuthError`,
+  `NoteRateLimitError`, `NoteTimeoutError`, `NoteValidationError` (raised
+  once retries are exhausted) — are the only things a caller should ever
+  catch, mirroring `app/transcription/base.py`'s exception set exactly.
+- `NoteGenerator.last_retry_count` is a plain instance attribute (not
+  part of `SoapNote`'s schema) that `generate_soap()` sets on every call
+  — generation metadata for the audit trail, not part of the note.
+
+### Scrubbing (`app/notes/scrub.py`)
+
+A conservative, non-LLM, rule-based pre-step strips clearly non-clinical
+chatter (greetings, small talk, sign-offs) before the transcript reaches
+the generator. The bias is deliberately toward *keeping* a sentence: it's
+only dropped when it matches a chatter phrase pattern **and** contains no
+clinical-content marker — a sentence that reads as small talk but carries
+a clinical detail (e.g. "By the way, I've also noticed some swelling in
+my ankles.") survives. Toggle with `NOTE_SCRUB_ENABLED` (default `true`).
+The original `Transcript` row is never touched — scrubbing only ever
+produces a new in-memory string.
+
+### Retry-then-degrade
+
+`OpenAINoteGenerator` requests JSON output, parses it, and validates it
+against `_RawSoapOutput` (exactly four required, non-empty keys —
+`extra="forbid"` makes "the model added/omitted a key" a validation
+failure). On failure, the validation error is fed back into the next
+attempt's prompt ("your previous response failed schema validation:
+...") for up to `NOTE_MAX_RETRIES` retries; transient/rate-limit errors
+get the same exponential-backoff-with-jitter retry as
+`app/transcription/openai.py`. If every attempt fails, `generate_soap`
+raises `NoteValidationError` (or whatever typed error the last attempt
+produced) — it never returns a partial or invalid note.
+
+`app/services/note_service.py`'s **DEGRADATION POLICY** catches that:
+the visit is never lost. A `Note` stub is persisted (`status=draft`,
+`degraded=True`, all four SOAP sections `None`, `full_text` set to the
+**raw transcript**) so `POST /v1/sessions/{id}/note`'s response always
+has something the clinician can read in `note.full_text` — the transcript
+itself when degraded, the composed SOAP text otherwise. The session moves
+to `SessionStatus.complete_degraded` (a new enum value, migration
+`6e70ea786d86`) rather than `complete`, so a session list can tell "note
+ready" apart from "needs manual note writing" without joining `notes`.
+Audit entries, same style as Phase 5's: `note.created` (`action=create`,
+`resource_type="note"`) on success, `note.degraded` (a new `AuditAction`
+value) on degradation — both PHI-free (provider, model, `prompt_version`,
+`retry_count`, `degraded` — never note/transcript text).
+
+### Prompt versioning (`app/notes/prompts/soap_primary_care_v1.py`)
+
+The Primary-Care SOAP system prompt lives in its own versioned module —
+`PROMPT_VERSION = "soap_primary_care_v1"` — rather than an inline string,
+so a prompt change is a new file (`soap_primary_care_v2.py`, ...), never
+an in-place edit. `Note.prompt_version` persists which exact prompt
+produced a given note, on both success and degraded outcomes (the prompt
+was still attempted even when generation ultimately failed).
+
+### Vendor selection (`app/notes/factory.py`)
+
+`NOTE_GENERATOR_VENDOR` (`mock` | `openai`, default `mock`) with the
+identical guardrail shape as `app/transcription/factory.py`:
+`PHI_MODE=synthetic` always forces `mock`; `ENV=prod` with a vendor that
+resolves to `mock` fails fast; `NOTE_GENERATOR_VENDOR=openai` without
+`OPENAI_API_KEY` fails fast; and before real (non-synthetic) transcript
+text ever reaches OpenAI, a signed BAA *and* Zero Data Retention agreement
+must be in place (a deployment precondition the factory can't verify).
+`get_note_generator()` is the process-wide `@lru_cache` singleton
+`app/main.py`'s lifespan calls at startup, same fail-fast-at-boot
+reasoning as `get_transcriber()`.
+
+### LLM tracing
+
+Off by default (`NOTE_TRACING_ENABLED=false`). If enabled, `LANGFUSE_HOST`
+must point at a **self-hosted** Langfuse instance — `app/config.py`
+refuses to start if it looks like Langfuse Cloud, because tracing would
+otherwise send transcript/note PHI to a third party. No tracing SDK is
+wired in yet; `app/notes/openai.py`'s `_trace_generation` is a PHI-safe
+(metadata only) no-op hook point for a later phase.
 
 ## Logging and PHI
 
