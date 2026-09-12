@@ -40,6 +40,7 @@ import pytest_asyncio
 import redis.asyncio as redis
 from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
+from httpx_ws.transport import ASGIWebSocketTransport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -209,3 +210,28 @@ async def client() -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
+
+@pytest.fixture
+def ws_client() -> AsyncClient:
+    """Like `client`, but wired through httpx-ws's ASGI transport so
+    websocket_connect works too. Runs in-process, on the same event loop
+    as everything else in this test session — deliberately not
+    starlette.testclient.TestClient, which spins up its own thread and
+    event loop and would bind app/db/session.py's @lru_cache engine to a
+    *different* loop than the rest of the (session-scoped-loop) suite —
+    see this module's docstring on asyncio_default_fixture_loop_scope.
+
+    Deliberately NOT entered here (no `async with`, no yield-based
+    teardown): ASGIWebSocketTransport.__aenter__ creates an anyio task
+    group bound to the task that entered it, and __aexit__ must run in
+    that same task — a pytest-asyncio async-generator fixture's teardown
+    phase runs as a separate top-level task from its setup phase, which
+    trips anyio's "cancel scope in a different task" check. Callers
+    (tests/test_sessions_ws.py's `_connect`) enter and exit this client
+    themselves, within one `async with` in the test's own task.
+    """
+    from app.main import app
+
+    transport = ASGIWebSocketTransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")

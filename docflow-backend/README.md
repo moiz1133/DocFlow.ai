@@ -12,9 +12,13 @@ Backend for DocFlow.ai, an ambient AI medical scribe.
 - **Phase 4** (done): vendor-agnostic transcription interface
   (`app/transcription/`) with a mock and an OpenAI implementation,
   selected by env. Not wired to any route yet.
+- **Phase 5** (done): audio ingestion — a WebSocket streaming endpoint and
+  a non-streaming finalize fallback (`app/api/sessions.py`), wiring the
+  Phase 4 `Transcriber` interface to real sessions and persisting
+  transcripts, with zero-retention audio handling and consent-gated
+  retention. Ends at a stored transcript.
 
-Audio ingest, note generation, and full business routes land in later
-phases.
+Note generation and full business routes land in later phases.
 
 ## Stack
 
@@ -25,7 +29,8 @@ phases.
 - SQLAlchemy 2.0 (async, `Mapped[]` style) + Alembic, asyncpg driver
 - PyJWT, argon2-cffi (password hashing), pyotp (TOTP/MFA)
 - OpenAI SDK (transcription vendor — isolated behind `app/transcription/`)
-- Ruff, mypy, pytest for dev tooling
+- WebSockets (FastAPI/Starlette native) for live audio streaming
+- Ruff, mypy, pytest for dev tooling; `httpx-ws` for WS integration tests
 - Docker + docker-compose (app, PostgreSQL 16, Redis 7)
 
 ## Local development
@@ -81,6 +86,9 @@ All configuration is environment-driven (`app/config.py`), loaded via
   `OPENAI_TRANSCRIBE_MODEL` / `TRANSCRIBE_TIMEOUT_SECONDS` /
   `TRANSCRIBE_MAX_RETRIES`: transcription vendor selection — see
   "Transcription" below.
+- `MAX_SESSION_SECONDS` / `MAX_AUDIO_BYTES` / `WS_BUFFER_MAX_CHUNKS` /
+  `TRANSCRIPT_RETENTION_DEFAULT` (`none` | `consented` | `always`): audio
+  ingestion limits and retention policy — see "Audio ingestion" below.
 
 ## Auth
 
@@ -264,6 +272,92 @@ only transcriber this test suite ever actually calls. Constructor flags
 (`latency_seconds`, `simulate_rate_limit`, `simulate_empty_audio`) let
 tests exercise those paths deterministically without a real vendor
 outage or real timing.
+
+## Audio ingestion
+
+`app/api/sessions.py` (mounted at `/v1/sessions`) and
+`app/services/transcription_service.py` wire the Phase 4 `Transcriber`
+interface to real sessions. This phase ends at a stored transcript — no
+SOAP note generation (`SessionStatus.generating` exists on the model but
+nothing here ever sets it).
+
+### Session lifecycle
+
+- `POST /v1/sessions` — creates a session (`status=created`) for the
+  caller's practice; returns `{session_id}`.
+- `GET /v1/sessions/{id}` — status + whether a transcript exists.
+  Tenant-scoped like every other route: a guessed id from another
+  practice comes back 404, not 403 (RLS hides it — see `app/api/users.py`
+  for the same established pattern).
+- `POST /v1/sessions/{id}/finalize` — non-streaming fallback: upload a
+  whole recording (multipart), get `{transcript}` back. Shares
+  `app.services.transcription_service.persist_transcript` with the WS
+  path, so both are identical from "transcribed" onward.
+- Status transitions this phase drives: `created` → `recording` →
+  `transcribing` → `complete` (or → `error` on any failure).
+
+### WebSocket (`/v1/sessions/{id}/stream`)
+
+**Auth**: the access token is passed as a query parameter
+(`?token=<access_token>`), not a header — a browser/extension WS
+handshake can't reliably set `Authorization`. Validated identically to
+`get_current_user` (decode → active user → tenant match) before anything
+else happens; failure closes with code `4401`. An unknown or
+another-practice's session closes `4404` (same RLS-hides-it reasoning as
+the REST routes above — there's no way to distinguish "doesn't exist"
+from "exists, wrong tenant" without leaking existence, so this
+deliberately doesn't try to use `4403`).
+
+**Protocol**:
+- Client → server: binary frames are raw audio chunks. JSON text frames:
+  `{"type": "start", "format": {"mime": ..., "sample_rate": ...}}` and
+  `{"type": "stop"}`.
+- Server → client (JSON): `{"type": "session.status", "status": ...}`,
+  `{"type": "transcript.partial", "text": ...}`,
+  `{"type": "transcript.final", "text": ..., "segments": [...]}`,
+  `{"type": "error", "code": ..., "message": ...}` (`message` is always
+  PHI-free).
+
+**Buffering/backpressure**: incoming audio goes onto a bounded
+`asyncio.Queue` (`WS_BUFFER_MAX_CHUNKS`) that feeds `transcriber.stream()`
+through an async-generator bridge; a client producing audio faster than
+it's consumed blocks on `queue.put` rather than growing the buffer
+without limit. `MAX_AUDIO_BYTES` / `MAX_SESSION_SECONDS` are enforced on
+every incoming frame — exceeding either sends an `error` event and closes
+`4413`.
+
+**Zero-retention**: raw audio is never written to disk, S3, or any
+database column, anywhere in this phase. Every point audio is actually
+held — the WS queue, the finalize route's in-memory upload — is marked
+with a `NEVER-PERSIST` comment. `tests/test_sessions_ws.py` backs this
+with both a dynamic check (spies on `open()` for any write-mode call
+during a full streaming session) and a static one (AST-scans
+`app/api/sessions.py` and `app/services/transcription_service.py` for
+disk/object-storage API names), the same two-layer technique Phase 4
+uses for its vendor-isolation guardrail.
+
+### Retention gating
+
+`Transcript.is_retained` is never implied by the row merely existing (see
+`app/models/transcript.py`). `TRANSCRIPT_RETENTION_DEFAULT` governs the
+default when no session-scoped `Consent(consent_type=retention,
+granted=True)` exists: `"none"` never retains, `"consented"` (default)
+retains only with an explicit consent on file, `"always"` retains
+unconditionally. When retention is denied, a `Transcript` row is still
+created (so "does a transcript exist" stays meaningful and re-finalizing
+stays idempotent) but with empty `content`/`segments` — the caller who
+just submitted the audio still gets the real transcript back in the HTTP/
+WS response; only what's persisted is gated.
+
+### Audit trail additions
+
+`session.created`, `stream.started` (a new `AuditAction` enum value —
+see migration `6243b19b618c`), and `transcript.created` are written via
+`app.services.transcription_service.record_ingestion_event`, PHI-free
+(provider name, counts, durations — never transcript text). A failed
+transcription also writes an audit entry (`action=update`,
+`metadata={"status": "error", "reason": <error code>}`) and sets the
+session to `error`.
 
 ## Logging and PHI
 

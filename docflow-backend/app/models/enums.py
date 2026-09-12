@@ -55,3 +55,6 @@ class AuditAction(str, enum.Enum):
     mfa_enrolled = "mfa_enrolled"
     mfa_verified = "mfa_verified"
     token_reuse_detected = "token_reuse_detected"
+    # Audio ingestion (Phase 5). Distinct from `create` because nothing is
+    # created when a stream starts — kept as its own queryable event type.
+    stream_started = "stream_started"
