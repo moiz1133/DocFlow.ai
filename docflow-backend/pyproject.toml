@@ -12,6 +12,10 @@ dependencies = [
     "redis>=5.1.0",
     "sqlalchemy[asyncio]>=2.0.35",
     "alembic>=1.13.3",
+    "pyjwt>=2.9.0",
+    "argon2-cffi>=23.1.0",
+    "pyotp>=2.9.0",
+    "email-validator>=2.2.0",
 ]
 
 [dependency-groups]
@@ -91,6 +95,14 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Session-scoped, not the default per-test loop: app/db/session.py's
+# engines are process-lifetime @lru_cache singletons (matching production,
+# where one engine serves the whole app), so their connection pools must
+# stay bound to a single event loop for the whole test session — a fresh
+# loop per test would hand asyncpg connections created on a since-closed
+# loop back to a new one, which is silently broken on Windows.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 addopts = "--cov=app --cov-report=term-missing"
 

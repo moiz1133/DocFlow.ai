@@ -2,7 +2,7 @@
 
 import asyncio
 
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -33,6 +33,21 @@ async def _table_names(admin_url: str) -> set[str]:
     return names
 
 
+async def _clear_audit_logs(admin_url: str) -> None:
+    """Other tests in this shared session-scoped database write real
+    audit_logs rows using the Phase 3 auth enum values (register,
+    login_success, ...). Downgrading past that migration shrinks
+    audit_action back down and would legitimately fail if any row still
+    referenced a value being removed — clear the table first so this
+    test's downgrade always exercises the empty-database happy path,
+    regardless of what other tests ran before it.
+    """
+    engine = create_async_engine(admin_url)
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM audit_logs"))
+    await engine.dispose()
+
+
 def test_upgrade_then_downgrade_round_trip(admin_url: str) -> None:
     """head -> base -> head, leaving the schema at head either way.
 
@@ -42,6 +57,7 @@ def test_upgrade_then_downgrade_round_trip(admin_url: str) -> None:
     already-active event loop.
     """
     assert asyncio.run(_table_names(admin_url)) >= EXPECTED_TABLES
+    asyncio.run(_clear_audit_logs(admin_url))
 
     try:
         command.downgrade(_alembic_config(admin_url), "base")

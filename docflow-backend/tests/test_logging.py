@@ -57,3 +57,29 @@ def test_phi_field_is_case_insensitive() -> None:
     payload = json.loads(formatter.format(record))
 
     assert payload["SSN"] == REDACTED
+
+
+def test_auth_secret_fields_are_redacted() -> None:
+    """Phase 3: passwords, tokens, and MFA secrets must never reach logs,
+    same as clinical PHI.
+    """
+    record = _build_record(
+        password="hunter2",
+        access_token="eyJhbGciOiJIUzI1NiJ9.fake.token",
+        refresh_token="eyJhbGciOiJIUzI1NiJ9.fake.refresh",
+        mfa_secret="JBSWY3DPEHPK3PXP",
+        totp_code="123456",
+    )
+
+    filt = PHIRedactionFilter()
+    filt.filter(record)
+
+    formatter = JSONFormatter()
+    payload = json.loads(formatter.format(record))
+
+    assert payload["password"] == REDACTED
+    assert payload["access_token"] == REDACTED
+    assert payload["refresh_token"] == REDACTED
+    assert payload["mfa_secret"] == REDACTED
+    assert payload["totp_code"] == REDACTED
+    assert "hunter2" not in json.dumps(payload)
