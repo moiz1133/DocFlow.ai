@@ -65,11 +65,12 @@ ignore = [
 known-first-party = ["app"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-# Fast, CI-native complement to tests/test_transcription_isolation.py:
-# the `openai` SDK must only ever be imported from
-# app/transcription/openai.py (re-enabled via per-file-ignores below), so
-# nothing downstream can accidentally couple to it.
-"openai" = { msg = "Import openai only inside app/transcription/openai.py — see that module's docstring." }
+# Fast, CI-native complement to tests/test_transcription_isolation.py and
+# tests/test_notes_isolation.py: the `openai` SDK must only ever be
+# imported from app/transcription/openai.py or app/notes/openai.py
+# (re-enabled via per-file-ignores below), so nothing downstream can
+# accidentally couple to it.
+"openai" = { msg = "Import openai only inside app/transcription/openai.py or app/notes/openai.py — see those modules' docstrings." }
 
 [tool.ruff.lint.per-file-ignores]
 # Alembic's own revision template uses typing.Sequence/Union and leaves
@@ -79,10 +80,13 @@ known-first-party = ["app"]
 # The one application file allowed to import the openai SDK — see the
 # banned-api rule above and tests/test_transcription_isolation.py.
 "app/transcription/openai.py" = ["TID251"]
-# Unit tests for OpenAITranscriber construct real SDK exception instances
-# to verify error translation — see that test module's docstring for why
-# this doesn't weaken the isolation guarantee (it's scoped to app/).
+"app/notes/openai.py" = ["TID251"]
+# Unit tests for OpenAITranscriber/OpenAINoteGenerator construct real SDK
+# exception instances to verify error translation — see those test
+# modules' docstrings for why this doesn't weaken the isolation
+# guarantee (it's scoped to app/).
 "tests/test_transcription_openai.py" = ["TID251"]
+"tests/test_notes_openai.py" = ["TID251"]
 
 [tool.ruff.format]
 quote-style = "double"

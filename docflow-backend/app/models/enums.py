@@ -26,6 +26,12 @@ class SessionStatus(str, enum.Enum):
     generating = "generating"
     complete = "complete"
     error = "error"
+    # Phase 6: note generation failed (after retries) and the session was
+    # degraded to just the transcript rather than losing the visit — see
+    # app/services/note_service.py. Distinct from `complete` so a
+    # clinician-facing session list can tell "note ready" apart from
+    # "needs manual note writing" without joining notes.
+    complete_degraded = "complete_degraded"
 
 
 class NoteStatus(str, enum.Enum):
@@ -58,3 +64,7 @@ class AuditAction(str, enum.Enum):
     # Audio ingestion (Phase 5). Distinct from `create` because nothing is
     # created when a stream starts — kept as its own queryable event type.
     stream_started = "stream_started"
+    # SOAP note generation (Phase 6). note.created reuses `create`
+    # (resource_type="note"); note.degraded is kept distinct since it
+    # marks a materially different outcome — a stub, not a real note.
+    note_degraded = "note_degraded"

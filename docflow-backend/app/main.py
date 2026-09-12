@@ -9,10 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
+from app.api.notes import router as notes_router
 from app.api.sessions import router as sessions_router
 from app.api.users import router as users_router
 from app.config import get_settings
 from app.logging import configure_logging
+from app.notes.factory import get_note_generator
 from app.transcription.factory import get_transcriber
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # surfacing as a 500 on some patient's first recorded visit.
     # get_transcriber() itself logs the selected provider.
     get_transcriber()
+    # Same fail-fast reasoning for NOTE_GENERATOR_VENDOR (see
+    # app/notes/factory.py's guardrails) — get_note_generator() itself
+    # logs the selected provider.
+    get_note_generator()
     yield
 
 
@@ -58,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(users_router)
     app.include_router(sessions_router)
+    app.include_router(notes_router)
     return app
 
 

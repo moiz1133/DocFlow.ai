@@ -110,6 +110,34 @@ class Settings(BaseSettings):
     # "always": retain unconditionally.
     TRANSCRIPT_RETENTION_DEFAULT: Literal["none", "consented", "always"] = "consented"
 
+    # Vendor selection for app/notes/ — see app/notes/factory.py for the
+    # guardrails (same shape as TRANSCRIBER_VENDOR's: PHI_MODE=synthetic
+    # always forces "mock"; ENV=prod refuses "mock"). OPENAI_API_KEY is
+    # shared with the transcription vendor; the note-generation model is
+    # deliberately separate since the two calls have different needs.
+    NOTE_GENERATOR_VENDOR: Literal["mock", "openai"] = "mock"
+    OPENAI_NOTE_MODEL: str = "gpt-4o"
+    NOTE_MAX_RETRIES: int = 2
+    NOTE_TIMEOUT_SECONDS: float = 30.0
+    # Conservative heuristic pre-step (app/notes/scrub.py) that strips
+    # non-clinical chatter before the transcript reaches the note
+    # generator. Toggleable because it's a judgment call some deployments
+    # may want to disable while tuning it.
+    NOTE_SCRUB_ENABLED: bool = True
+    # Tag persisted on every generated Note (see app/models/note.py) so a
+    # prompt change is traceable to exactly which notes used it — bump
+    # this (and add a new app/notes/prompts/soap_primary_care_vN.py) when
+    # the prompt changes, rather than editing the existing version in place.
+    NOTE_PROMPT_VERSION: str = "soap_primary_care_v1"
+
+    # LLM tracing for app/notes/ generation calls — off by default. When
+    # enabled, LANGFUSE_HOST must point at a SELF-HOSTED Langfuse
+    # instance: Langfuse Cloud would mean transcript/note PHI leaving this
+    # process to a third party, which is never acceptable here regardless
+    # of BAA status for the LLM vendor itself.
+    NOTE_TRACING_ENABLED: bool = False
+    LANGFUSE_HOST: str | None = None
+
     @field_validator("CORS_WEB_ORIGINS", "CORS_EXTENSION_ORIGINS", mode="before")
     @classmethod
     def _parse_csv_origins(cls, value: object) -> object:
@@ -128,6 +156,20 @@ class Settings(BaseSettings):
                 raise ValueError("SECRET_KEY must be a real secret when ENV=prod")
             if _looks_like_placeholder(self.JWT_SECRET):
                 raise ValueError("JWT_SECRET must be a real secret when ENV=prod")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tracing_is_self_hosted(self) -> "Settings":
+        if self.NOTE_TRACING_ENABLED:
+            if not self.LANGFUSE_HOST:
+                raise ValueError("LANGFUSE_HOST must be set when NOTE_TRACING_ENABLED is true")
+            host = self.LANGFUSE_HOST.lower()
+            if "cloud.langfuse.com" in host:
+                raise ValueError(
+                    "LANGFUSE_HOST must point at a self-hosted Langfuse instance, "
+                    "never Langfuse Cloud — tracing would otherwise send PHI "
+                    "(transcript/note text) to a third party"
+                )
         return self
 
 
