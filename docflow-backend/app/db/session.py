@@ -32,9 +32,31 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI-dependency-shaped session provider for later phases."""
+    """FastAPI-dependency-shaped session provider."""
     async with get_sessionmaker()() as session:
         yield session
+
+
+@lru_cache
+def get_admin_engine() -> AsyncEngine:
+    """The admin/migration-role engine. NOT for business queries.
+
+    The one legitimate exception is login: resolving "which practice does
+    this email belong to" is inherently a cross-tenant lookup, and RLS's
+    fail-closed default (no tenant GUC set -> zero rows) makes it
+    impossible to find a user by email alone under the restricted role.
+    This engine exists solely for that single, narrow read — see
+    app/auth/login in app/api/auth.py and the README ("Database roles and
+    RLS") for why this is safe: it is read-only, returns only the fields
+    needed to route to the right tenant, and every subsequent query in the
+    same request goes back through the tenant-scoped app role.
+    """
+    return create_async_engine(get_settings().DATABASE_URL, pool_pre_ping=True)
+
+
+@lru_cache
+def get_admin_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(get_admin_engine(), expire_on_commit=False)
 
 
 async def set_tenant(session: AsyncSession, practice_id: uuid.UUID | str) -> None:
@@ -47,7 +69,8 @@ async def set_tenant(session: AsyncSession, practice_id: uuid.UUID | str) -> Non
     before any tenant-scoped query runs in it.
 
     Per-request wiring — deriving practice_id from the authenticated user
-    and calling this at the start of each request — lands in Phase 3.
+    and calling this at the start of each request — is done by
+    app.auth.dependencies.get_tenant_session (see app/api/auth.py).
     """
     pid = practice_id if isinstance(practice_id, uuid.UUID) else uuid.UUID(str(practice_id))
     # SET does not accept bound parameters; interpolating is safe here only

@@ -35,6 +35,19 @@ PHI_SENSITIVE_FIELDS = frozenset(
         "email",
         "phone",
         "address",
+        # Auth secrets — never PHI, but equally must never reach logs.
+        "password",
+        "hashed_password",
+        "token",
+        "access_token",
+        "refresh_token",
+        "mfa_pending_token",
+        "mfa_secret",
+        "totp_code",
+        "otp_code",
+        "secret",
+        "jwt_secret",
+        "authorization",
     }
 )
 

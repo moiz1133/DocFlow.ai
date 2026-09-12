@@ -18,17 +18,28 @@ from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://docflow:docflow@localhost:5433/docflow")
+os.environ.setdefault("JWT_SECRET", "test-jwt-secret-at-least-32-bytes-long")
+# Point straight at docflow_test (not docflow): app.db.session.get_engine()
+# reads APP_DATABASE_URL directly (not through the _with_dbname swap
+# below), and it must land on the exact same throwaway database that
+# _provisioned_database creates/migrates/drops — otherwise HTTP-level
+# tests hitting the real app would write to the dev database while
+# fixtures asserting on the DB would read from docflow_test.
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://docflow:docflow@localhost:5433/docflow_test"
+)
 os.environ.setdefault(
     "APP_DATABASE_URL",
-    "postgresql+asyncpg://docflow_app:docflow_app_dev_only@localhost:5433/docflow",
+    "postgresql+asyncpg://docflow_app:docflow_app_dev_only@localhost:5433/docflow_test",
 )
 os.environ.setdefault("REDIS_URL", "redis://localhost:6380/0")
 os.environ.setdefault("ENV", "dev")
 
 import pytest
 import pytest_asyncio
+import redis.asyncio as redis
 from alembic.config import Config
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -172,3 +183,29 @@ async def two_practices(
         )
 
     return result
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _flush_rate_limit_keys() -> AsyncIterator[None]:
+    """Rate-limit counters are keyed by (action, client IP), and every
+    test request comes from the same fake TestClient IP — without this,
+    unrelated tests hitting /login or /refresh many times in one pytest
+    session would eventually trip each other's 429s.
+    """
+    client = redis.from_url(get_settings().REDIS_URL)
+    try:
+        async for key in client.scan_iter(match="ratelimit:*"):
+            await client.delete(key)
+        yield
+    finally:
+        await client.aclose()
+
+
+@pytest_asyncio.fixture
+async def client() -> AsyncIterator[AsyncClient]:
+    """An httpx client wired directly to the FastAPI app (no real socket)."""
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac

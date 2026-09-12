@@ -1,4 +1,4 @@
-.PHONY: install run test lint format typecheck up down db-up migrate-up migrate-down seed
+.PHONY: install run test lint format typecheck up down db-up redis-up migrate-up migrate-down seed
 
 install:
 	uv sync
@@ -11,7 +11,12 @@ db-up:
 	@echo "Waiting for Postgres to become healthy..."
 	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' docflow-backend-db-1 2>/dev/null)" = "healthy" ]; do sleep 1; done
 
-test: db-up
+redis-up:
+	docker compose up -d redis
+	@echo "Waiting for Redis to become healthy..."
+	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' docflow-backend-redis-1 2>/dev/null)" = "healthy" ]; do sleep 1; done
+
+test: db-up redis-up
 	uv run pytest
 
 lint:

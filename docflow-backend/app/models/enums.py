@@ -45,3 +45,13 @@ class AuditAction(str, enum.Enum):
     update = "update"
     delete = "delete"
     export = "export"
+    # Auth events (Phase 3). Kept distinct from the CRUD actions above
+    # rather than overloading e.g. "create" for login, so audit_logs stays
+    # directly queryable by event type (`WHERE action = 'login_failure'`).
+    register = "register"
+    login_success = "login_success"
+    login_failure = "login_failure"
+    logout = "logout"
+    mfa_enrolled = "mfa_enrolled"
+    mfa_verified = "mfa_verified"
+    token_reuse_detected = "token_reuse_detected"
