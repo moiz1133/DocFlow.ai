@@ -83,3 +83,27 @@ def test_auth_secret_fields_are_redacted() -> None:
     assert payload["mfa_secret"] == REDACTED
     assert payload["totp_code"] == REDACTED
     assert "hunter2" not in json.dumps(payload)
+
+
+def test_transcription_content_fields_are_redacted() -> None:
+    """Phase 4: audio bytes and transcript text must never reach logs,
+    only metadata (provider, duration, segment counts, ...).
+    """
+    record = _build_record(
+        full_text="patient reports chest pain since Tuesday",
+        segments=[{"speaker": None, "start": 0.0, "end": 3.2, "text": "chest pain"}],
+        audio_bytes=b"\x00\x01\x02fake-audio",
+        provider="mock",
+    )
+
+    filt = PHIRedactionFilter()
+    filt.filter(record)
+
+    formatter = JSONFormatter()
+    payload = json.loads(formatter.format(record))
+
+    assert payload["full_text"] == REDACTED
+    assert payload["segments"] == REDACTED
+    assert payload["audio_bytes"] == REDACTED
+    assert payload["provider"] == "mock"  # metadata, not content — passes through
+    assert "chest pain" not in json.dumps(payload)

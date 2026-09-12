@@ -79,6 +79,18 @@ class Settings(BaseSettings):
     CORS_WEB_ORIGINS: Annotated[list[str], NoDecode] = []
     CORS_EXTENSION_ORIGINS: Annotated[list[str], NoDecode] = []
 
+    # Vendor selection for app/transcription/ — see
+    # app/transcription/factory.py for the guardrails around this
+    # (PHI_MODE=synthetic always forces "mock"; ENV=prod refuses "mock").
+    TRANSCRIBER_VENDOR: Literal["mock", "openai"] = "mock"
+    OPENAI_API_KEY: str | None = None
+    # gpt-4o-transcribe is OpenAI's current general-purpose transcription
+    # model; whisper-1 remains available where segment-level timestamps
+    # matter more than transcription quality.
+    OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-transcribe"
+    TRANSCRIBE_TIMEOUT_SECONDS: float = 30.0
+    TRANSCRIBE_MAX_RETRIES: int = 2
+
     @field_validator("CORS_WEB_ORIGINS", "CORS_EXTENSION_ORIGINS", mode="before")
     @classmethod
     def _parse_csv_origins(cls, value: object) -> object:

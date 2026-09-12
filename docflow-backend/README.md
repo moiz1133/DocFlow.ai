@@ -9,8 +9,11 @@ Backend for DocFlow.ai, an ambient AI medical scribe.
   Row-Level Security.
 - **Phase 3** (done): stateless JWT auth (access + refresh, MFA-ready,
   role-based access), per-request RLS wiring.
+- **Phase 4** (done): vendor-agnostic transcription interface
+  (`app/transcription/`) with a mock and an OpenAI implementation,
+  selected by env. Not wired to any route yet.
 
-The transcription/note pipeline and full business routes land in later
+Audio ingest, note generation, and full business routes land in later
 phases.
 
 ## Stack
@@ -21,6 +24,7 @@ phases.
 - Structured JSON logging with PHI + auth-secret redaction
 - SQLAlchemy 2.0 (async, `Mapped[]` style) + Alembic, asyncpg driver
 - PyJWT, argon2-cffi (password hashing), pyotp (TOTP/MFA)
+- OpenAI SDK (transcription vendor — isolated behind `app/transcription/`)
 - Ruff, mypy, pytest for dev tooling
 - Docker + docker-compose (app, PostgreSQL 16, Redis 7)
 
@@ -73,6 +77,10 @@ All configuration is environment-driven (`app/config.py`), loaded via
 - `CORS_WEB_ORIGINS` / `CORS_EXTENSION_ORIGINS`: comma-separated explicit
   origin lists (never `"*"`); extension origins use the
   `chrome-extension://<id>` scheme.
+- `TRANSCRIBER_VENDOR` (`mock` | `openai`) / `OPENAI_API_KEY` /
+  `OPENAI_TRANSCRIBE_MODEL` / `TRANSCRIBE_TIMEOUT_SECONDS` /
+  `TRANSCRIBE_MAX_RETRIES`: transcription vendor selection — see
+  "Transcription" below.
 
 ## Auth
 
@@ -166,6 +174,96 @@ but the hook is real: tightening it is a config change, not new plumbing.
 is only logged when the email matched a real user (so there's a tenant to
 attribute it to); an unknown-email attempt is covered by the rate limiter
 instead, not an audit row, since there's no tenant to write one against.
+
+## Transcription
+
+`app/transcription/` is a vendor-agnostic transcription interface. The
+entire point is isolation: **nothing outside `app/transcription/` may
+import or know about a vendor SDK** — not the audio ingest that'll call
+this in a later phase, not note generation, nothing. This is enforced
+three ways at once: `pyproject.toml`'s `flake8-tidy-imports` banned-api
+rule fails `make lint` if any file other than
+`app/transcription/openai.py` imports `openai`; the factory only imports
+`openai` lazily inside its "openai" branch; and
+`tests/test_transcription_isolation.py` statically AST-scans every file
+under `app/` for an `openai` import and also dynamically asserts
+selecting the mock vendor never touches `sys.modules["openai"]`.
+
+### The interface (`app/transcription/base.py`)
+
+- `Transcriber.transcribe(chunks, *, language=None) -> TranscriptionResult`
+  — batch/whole-utterance transcription, the primary path for a
+  file-based vendor like OpenAI.
+- `Transcriber.stream(chunks) -> AsyncIterator[TranscriptionEvent]` —
+  partial/final events as audio arrives.
+- `AudioChunk`, `TranscriptSegment`, `TranscriptionResult`,
+  `TranscriptionEvent` are plain dataclasses, not vendor types.
+  `TranscriptSegment.to_jsonb()` produces exactly the shape Phase 2's
+  `Transcript.segments` JSONB column expects
+  (`{speaker, start, end, text}`) — persistence never needs to know which
+  vendor produced a result.
+- `speaker` is `None` for every v1 vendor (OpenAI does not diarize) but
+  exists on `TranscriptSegment` from day one so a diarizing vendor can
+  start populating it later with zero shape changes downstream.
+- Typed exceptions — `TranscriptionError` (base),
+  `TranscriptionAuthError`, `TranscriptionRateLimitError`,
+  `TranscriptionTimeoutError` — are the only things a caller should ever
+  catch. Every implementation is required to translate vendor errors into
+  these; `app/transcription/openai.py`'s `_translate_error` is the
+  reference example.
+
+### Streaming emulation
+
+OpenAI's file-based transcription API has no true real-time streaming
+for this use case. `OpenAITranscriber.stream()` buffers incoming chunks
+into fixed-size windows (`_DEFAULT_STREAM_WINDOW_CHUNK_COUNT` chunks per
+window), calls `transcribe()` once per window, and yields a single
+`"final"` `TranscriptionEvent` per window — never `"partial"`, since
+there's no visibility into a window's transcript until the vendor call
+for it completes. `transcribe()`'s own windowing is a *different*
+concern: it splits by cumulative byte size (`_MAX_WINDOW_BYTES`, staying
+under OpenAI's upload limit) rather than chunk count, and stitches the
+per-window results back into one `TranscriptionResult` in order. A
+genuinely streaming vendor (e.g. Deepgram) would override `stream()`
+entirely with a real partial-event cadence instead of emulating one this
+way.
+
+### Vendor selection (`app/transcription/factory.py`)
+
+`TRANSCRIBER_VENDOR` (`mock` | `openai`, default `mock`) picks the
+implementation, with guardrails that fail application startup rather
+than fail some request later:
+
+- `PHI_MODE=synthetic` **always** forces `mock`, regardless of
+  `TRANSCRIBER_VENDOR` — real vendors only ever handle real, BAA-covered
+  audio, and synthetic (dev/test) data must never leave the process.
+- `ENV=prod` with a vendor that resolves to `mock` fails fast — a real
+  vendor is required in production.
+- `TRANSCRIBER_VENDOR=openai` without `OPENAI_API_KEY` set fails fast.
+- **Before `TRANSCRIBER_VENDOR=openai` ever runs against real (non-
+  synthetic) audio**, a signed BAA *and* a Zero Data Retention agreement
+  with OpenAI must be in place. The factory has no way to verify that
+  operationally — it's a deployment precondition, not a check code can
+  make — so this is a process requirement, not just a config flag.
+
+`get_transcriber()` is a process-wide `@lru_cache` singleton (matching
+the zero-arg convention already used by `app/db/session.py`'s
+`get_engine()`/`get_sessionmaker()`); `build_transcriber(settings)` is
+the pure, unmemoized selection logic underneath it, for tests that need
+a custom `Settings`. `app/main.py`'s lifespan calls `get_transcriber()`
+at startup — both so a misconfigured vendor fails immediately instead of
+on a patient's first recorded visit, and so the selected provider name
+(never content) gets logged once, at boot.
+
+### Mock (`app/transcription/mock.py`)
+
+`MockTranscriber` needs no network and no keys: it returns a
+deterministic, synthetic primary-care-visit transcript fixture. It's the
+default whenever `PHI_MODE=synthetic` (i.e. always in dev/test) and the
+only transcriber this test suite ever actually calls. Constructor flags
+(`latency_seconds`, `simulate_rate_limit`, `simulate_empty_audio`) let
+tests exercise those paths deterministically without a real vendor
+outage or real timing.
 
 ## Logging and PHI
 

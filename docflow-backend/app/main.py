@@ -12,6 +12,7 @@ from app.api.health import router as health_router
 from app.api.users import router as users_router
 from app.config import get_settings
 from app.logging import configure_logging
+from app.transcription.factory import get_transcriber
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings)
     logger.info("startup complete", extra={"env": settings.ENV, "phi_mode": settings.PHI_MODE})
+    # Selecting the transcriber here (rather than lazily, on first use)
+    # means a misconfigured TRANSCRIBER_VENDOR (see
+    # app/transcription/factory.py's guardrails — e.g. ENV=prod with
+    # vendor="mock") fails application startup immediately instead of
+    # surfacing as a 500 on some patient's first recorded visit.
+    # get_transcriber() itself logs the selected provider.
+    get_transcriber()
     yield
 
 
