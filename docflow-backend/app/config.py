@@ -91,6 +91,25 @@ class Settings(BaseSettings):
     TRANSCRIBE_TIMEOUT_SECONDS: float = 30.0
     TRANSCRIBE_MAX_RETRIES: int = 2
 
+    # Hard ceilings for a single WS audio-streaming session (see
+    # app/api/sessions.py) — exceeding either ends the connection with
+    # close code 4413 rather than letting a runaway client stream forever.
+    MAX_SESSION_SECONDS: int = 3600
+    MAX_AUDIO_BYTES: int = 100 * 1024 * 1024
+    # Bounded per-connection audio queue depth. A client producing audio
+    # faster than the transcriber can consume it blocks on the queue
+    # (backpressure) instead of buffering without limit — see
+    # app/services/transcription_service.py.
+    WS_BUFFER_MAX_CHUNKS: int = 50
+
+    # Governs Transcript.is_retained when no session-scoped retention
+    # Consent (ConsentType.retention) exists — see
+    # app/services/transcription_service.py's _resolve_retention.
+    # "none": never retain, regardless of consent. "consented" (default):
+    # retain only with an explicit granted retention consent on file.
+    # "always": retain unconditionally.
+    TRANSCRIPT_RETENTION_DEFAULT: Literal["none", "consented", "always"] = "consented"
+
     @field_validator("CORS_WEB_ORIGINS", "CORS_EXTENSION_ORIGINS", mode="before")
     @classmethod
     def _parse_csv_origins(cls, value: object) -> object:

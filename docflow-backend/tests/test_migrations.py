@@ -1,7 +1,9 @@
 """Migrations apply and roll back cleanly."""
 
 import asyncio
+from collections.abc import AsyncIterator
 
+import pytest_asyncio
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -46,6 +48,25 @@ async def _clear_audit_logs(admin_url: str) -> None:
     async with engine.begin() as conn:
         await conn.execute(text("DELETE FROM audit_logs"))
     await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_app_engine_around_round_trip() -> AsyncIterator[None]:
+    """The round-trip test below drops and recreates every table via raw
+    alembic commands on their own ad-hoc asyncio.run() loops (see that
+    test's docstring). app.db.session.get_engine() is a process-wide
+    @lru_cache pool that other tests reuse via the `client` fixture; any
+    connection it already opened before the drop keeps asyncpg's
+    client-side prepared-statement cache pointing at the now-gone table
+    OIDs, so the next query through that pool raises
+    InvalidCachedStatementError. Disposing it here — on this fixture's
+    own (correct, session-scoped) event loop, unlike the test's ad-hoc
+    loops — forces fresh connections afterward.
+    """
+    yield
+    from app.db.session import get_engine
+
+    await get_engine().dispose()
 
 
 def test_upgrade_then_downgrade_round_trip(admin_url: str) -> None:
