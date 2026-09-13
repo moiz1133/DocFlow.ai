@@ -104,6 +104,51 @@ def test_real_phi_mode_with_blanket_retention_and_no_opt_in_refuses_to_start() -
         )
 
 
+def test_note_tracing_enabled_with_cloud_langfuse_host_refuses_to_start() -> None:
+    # Settings itself already refuses to construct with this combination
+    # (_validate_tracing_is_self_hosted) — bypass that the same way
+    # test_prod_with_debug_refuses_to_start bypasses _validate_prod_debug,
+    # to exercise the startup check's own independent re-assertion.
+    settings = _valid_prod_like_settings(NOTE_TRACING_ENABLED=False, LANGFUSE_HOST=None)
+    settings.NOTE_TRACING_ENABLED = True
+    settings.LANGFUSE_HOST = "https://cloud.langfuse.com"
+    with pytest.raises(StartupSafetyCheckFailed):
+        run_startup_safety_checks(settings)
+
+
+def test_note_tracing_enabled_with_no_langfuse_host_refuses_to_start() -> None:
+    settings = _valid_prod_like_settings(NOTE_TRACING_ENABLED=False, LANGFUSE_HOST=None)
+    settings.NOTE_TRACING_ENABLED = True
+    with pytest.raises(StartupSafetyCheckFailed):
+        run_startup_safety_checks(settings)
+
+
+def test_note_tracing_enabled_with_self_hosted_langfuse_host_passes() -> None:
+    run_startup_safety_checks(
+        _valid_prod_like_settings(
+            NOTE_TRACING_ENABLED=True, LANGFUSE_HOST="https://langfuse.internal.example.com"
+        )
+    )
+
+
+def test_trace_include_content_under_phi_mode_real_refuses_to_start() -> None:
+    # Settings itself already refuses this combination too
+    # (_validate_trace_content_restricted) — same bypass-then-reassert
+    # pattern as the tracing tests above.
+    settings = _valid_prod_like_settings(TRACE_INCLUDE_CONTENT=False)
+    settings.TRACE_INCLUDE_CONTENT = True
+    with pytest.raises(StartupSafetyCheckFailed):
+        run_startup_safety_checks(settings)
+
+
+def test_trace_include_content_under_env_prod_refuses_to_start() -> None:
+    settings = _settings(ENV="dev", DEBUG=False, PHI_MODE="synthetic", TRACE_INCLUDE_CONTENT=False)
+    settings.ENV = "prod"
+    settings.TRACE_INCLUDE_CONTENT = True
+    with pytest.raises(StartupSafetyCheckFailed):
+        run_startup_safety_checks(settings)
+
+
 def test_real_phi_mode_with_blanket_retention_and_opt_in_passes() -> None:
     run_startup_safety_checks(
         _valid_prod_like_settings(

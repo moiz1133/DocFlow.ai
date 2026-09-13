@@ -9,12 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
+from app.api.metrics import router as metrics_router
 from app.api.notes import router as notes_router
 from app.api.sessions import router as sessions_router
 from app.api.users import router as users_router
 from app.config import get_settings
 from app.logging import configure_logging
 from app.notes.factory import get_note_generator
+from app.ops.http_metrics import MetricsMiddleware
 from app.security.startup_checks import run_startup_safety_checks
 from app.security.transport import SecurityHeadersMiddleware, TLSEnforcementMiddleware
 from app.transcription.factory import get_transcriber
@@ -67,6 +69,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["Authorization", "Content-Type"],
     )
+    # HTTP request metrics (Phase 8) — see app/ops/http_metrics.py and
+    # GET /metrics (app/api/metrics.py). Registered before the two
+    # security middlewares below so TLSEnforcementMiddleware (outermost —
+    # see the comment on it) stays the very first thing an insecure
+    # request meets; a request TLS rejects is never counted here.
+    app.add_middleware(MetricsMiddleware)
     # TLS enforcement (in transit) and security headers — see
     # app/security/transport.py. Registered regardless of ENV; what
     # actually happens is entirely governed by settings.ENFORCE_TLS
@@ -78,6 +86,7 @@ def create_app() -> FastAPI:
     app.add_middleware(TLSEnforcementMiddleware, settings=settings)
 
     app.include_router(health_router)
+    app.include_router(metrics_router)
     app.include_router(auth_router)
     app.include_router(users_router)
     app.include_router(sessions_router)

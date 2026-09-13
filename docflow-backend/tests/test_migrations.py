@@ -54,19 +54,24 @@ async def _clear_audit_logs(admin_url: str) -> None:
 async def _dispose_app_engine_around_round_trip() -> AsyncIterator[None]:
     """The round-trip test below drops and recreates every table via raw
     alembic commands on their own ad-hoc asyncio.run() loops (see that
-    test's docstring). app.db.session.get_engine() is a process-wide
-    @lru_cache pool that other tests reuse via the `client` fixture; any
-    connection it already opened before the drop keeps asyncpg's
-    client-side prepared-statement cache pointing at the now-gone table
-    OIDs, so the next query through that pool raises
-    InvalidCachedStatementError. Disposing it here — on this fixture's
-    own (correct, session-scoped) event loop, unlike the test's ad-hoc
-    loops — forces fresh connections afterward.
+    test's docstring). app.db.session.get_engine() AND get_admin_engine()
+    are both process-wide @lru_cache pools other tests reuse (the `client`
+    fixture's requests use get_engine() via get_sessionmaker(); the login
+    route's cross-tenant email lookup — app/api/auth.py's
+    _find_user_by_email — specifically uses get_admin_sessionmaker(), i.e.
+    get_admin_engine()); any connection either pool already opened before
+    the drop keeps asyncpg's client-side prepared-statement cache pointing
+    at the now-gone table/type OIDs, so the next query through that pool
+    raises InvalidCachedStatementError — observed via a rate-limit test
+    that repeatedly calls POST /v1/auth/login (Phase 8). Disposing both
+    here — on this fixture's own (correct, session-scoped) event loop,
+    unlike the test's ad-hoc loops — forces fresh connections afterward.
     """
     yield
-    from app.db.session import get_engine
+    from app.db.session import get_admin_engine, get_engine
 
     await get_engine().dispose()
+    await get_admin_engine().dispose()
 
 
 def test_upgrade_then_downgrade_round_trip(admin_url: str) -> None:

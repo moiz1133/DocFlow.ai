@@ -1,10 +1,20 @@
-.PHONY: install run test lint format typecheck up down db-up redis-up migrate-up migrate-down seed rotate-key
+.PHONY: install run test lint format typecheck up down db-up redis-up migrate-up migrate-down seed rotate-key worker beat
 
 install:
 	uv sync
 
 run:
 	uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# Phase 8 — runs generate_note_task. Requires redis-up (broker/backend)
+# and db-up (the task itself opens tenant-scoped DB sessions).
+worker: db-up redis-up
+	uv run celery -A app.worker.celery_app worker --loglevel=info
+
+# Phase 8 — schedules purge_expired_data_task on Settings.PURGE_INTERVAL.
+# Run at most one beat process per deployment (see docker-compose.yml).
+beat: db-up redis-up
+	uv run celery -A app.worker.celery_app beat --loglevel=info
 
 db-up:
 	docker compose up -d db

@@ -1,23 +1,30 @@
 """Transcript -> scrub -> SOAP note -> persist pipeline (Phase 6),
-now gated by the Phase 7 consent authority and with PHI read/write
-access fully audited.
+gated by the Phase 7 consent authority, with PHI read/write access fully
+audited, and instrumented with Phase 8 metrics/tracing.
 
 A plain async callable taking only plain values (uuids), never a
-FastAPI Request/Session — so Phase 8 can move this to a Celery task with
-no rewrite; app/api/notes.py's route just awaits it directly for now.
-Opens its own short-lived, tenant-scoped DB transactions via
+FastAPI Request/Session — exactly what let Phase 8 move this onto a
+Celery task (app/worker/tasks.py's generate_note_task) with NO rewrite
+of this function: the task is a thin asyncio.run bridge around it.
+app/api/notes.py's route no longer calls this directly (see that
+module's docstring on the enqueue/poll split); the worker does. Opens
+its own short-lived, tenant-scoped DB transactions via
 app.services.transcription_service.tenant_session, the same helper the
-Phase 5 WS handler uses for the same reason (a caller outside an HTTP
-request can't reuse a request-scoped session) — and for the same benefit
-Phase 5 relies on: a concurrent GET /v1/sessions/{id} sees status
-transitions (generating -> complete/complete_degraded) as they commit,
-not only once the whole pipeline finishes.
+Phase 5 WS handler and the Phase 8 worker both use for the same reason
+(a caller outside an HTTP request can't reuse a request-scoped session)
+— and for the same benefit Phase 5 relies on: a concurrent
+GET /v1/sessions/{id}/note sees status transitions (generating ->
+complete/complete_degraded) as they commit, not only once the whole
+pipeline finishes.
 
 Nothing here imports a vendor SDK; every vendor interaction goes through
-the Phase 6 NoteGenerator interface (app/notes/base.py).
+the Phase 6 NoteGenerator interface (app/notes/base.py). Nothing here
+imports the Langfuse SDK either — that stays inside app/ops/tracing.py,
+called from here only through the vendor-neutral Tracer facade.
 """
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -29,6 +36,8 @@ from app.models.enums import AuditAction, NoteStatus, SessionStatus
 from app.notes.base import NoteContext, NoteGenerationError, SoapNote
 from app.notes.factory import get_note_generator
 from app.notes.scrub import HeuristicScrubber
+from app.ops.metrics import NOTE_GENERATION_LATENCY_SECONDS
+from app.ops.tracing import get_tracer
 from app.security.consent import ConsentService
 from app.services.audit_service import RequestMeta
 from app.services.transcription_service import record_ingestion_event, tenant_session
@@ -127,11 +136,29 @@ async def generate_note_for_session(
     )
 
     generator = get_note_generator()
+    tracer = get_tracer()
     context = NoteContext(specialty="primary_care")
 
+    generation_started_at = time.monotonic()
     try:
         soap = await generator.generate_soap(cleaned_text, context)
     except NoteGenerationError as exc:
+        latency_seconds = time.monotonic() - generation_started_at
+        NOTE_GENERATION_LATENCY_SECONDS.labels(
+            provider=generator.provider_name, outcome="degraded"
+        ).observe(latency_seconds)
+        tracer.record_note_generation(
+            session_id=session_id,
+            prompt_version=settings.NOTE_PROMPT_VERSION,
+            provider=generator.provider_name,
+            model=None,
+            transcript_text=cleaned_text,
+            soap=None,
+            retry_count=generator.last_retry_count,
+            degraded=True,
+            outcome=type(exc).__name__,
+            latency_seconds=latency_seconds,
+        )
         return await _persist_degraded(
             session_id=session_id,
             practice_id=practice_id,
@@ -142,6 +169,23 @@ async def generate_note_for_session(
             reason=type(exc).__name__,
             request_meta=request_meta,
         )
+
+    latency_seconds = time.monotonic() - generation_started_at
+    NOTE_GENERATION_LATENCY_SECONDS.labels(
+        provider=generator.provider_name, outcome="success"
+    ).observe(latency_seconds)
+    tracer.record_note_generation(
+        session_id=session_id,
+        prompt_version=settings.NOTE_PROMPT_VERSION,
+        provider=generator.provider_name,
+        model=soap.model,
+        transcript_text=cleaned_text,
+        soap=soap,
+        retry_count=generator.last_retry_count,
+        degraded=False,
+        outcome="success",
+        latency_seconds=latency_seconds,
+    )
 
     return await _persist_success(
         session_id=session_id,
