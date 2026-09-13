@@ -15,6 +15,8 @@ from app.api.users import router as users_router
 from app.config import get_settings
 from app.logging import configure_logging
 from app.notes.factory import get_note_generator
+from app.security.startup_checks import run_startup_safety_checks
+from app.security.transport import SecurityHeadersMiddleware, TLSEnforcementMiddleware
 from app.transcription.factory import get_transcriber
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings)
     logger.info("startup complete", extra={"env": settings.ENV, "phi_mode": settings.PHI_MODE})
+    # Refuses to finish starting (crashes the process) if any HIPAA
+    # control is disengaged for the current ENV/PHI_MODE combination —
+    # see app/security/startup_checks.py. Runs before vendor selection
+    # below so a misconfigured PHI_MODE=real deployment never gets far
+    # enough to even try building a real transcriber/note generator.
+    run_startup_safety_checks(settings)
     # Selecting the transcriber here (rather than lazily, on first use)
     # means a misconfigured TRANSCRIBER_VENDOR (see
     # app/transcription/factory.py's guardrails — e.g. ENV=prod with
@@ -59,6 +67,15 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["Authorization", "Content-Type"],
     )
+    # TLS enforcement (in transit) and security headers — see
+    # app/security/transport.py. Registered regardless of ENV; what
+    # actually happens is entirely governed by settings.ENFORCE_TLS
+    # (defaults True; .env.example turns it off for local dev). Starlette
+    # runs middleware in reverse-of-registration order on the way in, so
+    # TLSEnforcementMiddleware (added last here) is the outermost layer —
+    # an insecure request is rejected before CORS or routing ever see it.
+    app.add_middleware(SecurityHeadersMiddleware, settings=settings)
+    app.add_middleware(TLSEnforcementMiddleware, settings=settings)
 
     app.include_router(health_router)
     app.include_router(auth_router)

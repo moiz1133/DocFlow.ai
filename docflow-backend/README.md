@@ -22,6 +22,12 @@ Backend for DocFlow.ai, an ambient AI medical scribe.
   implementation, a conservative chatter-scrubbing pre-step, schema
   validation with retry-then-degrade, and `POST /v1/sessions/{id}/note`
   (`app/services/note_service.py`) wiring it to a Phase 5 transcript.
+- **Phase 7** (done): the HIPAA control layer — field-level AES-256
+  envelope encryption for PHI columns (`app/security/`), TLS enforcement
+  and security headers in transit, PHI *read* access auditing (not just
+  writes), a centralized consent gate before any retention, and a
+  fail-fast startup self-check that refuses to boot a misconfigured
+  `PHI_MODE=real` deployment. Hardens Phases 1-6; no new product surface.
 
 Full business routes (note editing/finalization, patient-facing views)
 land in later phases.
@@ -37,6 +43,8 @@ land in later phases.
 - OpenAI SDK (transcription + note-generation vendor — isolated behind
   `app/transcription/` and `app/notes/` respectively)
 - WebSockets (FastAPI/Starlette native) for live audio streaming
+- `cryptography` (AES-256-GCM envelope encryption — `app/security/`);
+  `boto3` optional/lazy, only for the AWS KMS key provider in production
 - Ruff, mypy, pytest for dev tooling; `httpx-ws` for WS integration tests
 - Docker + docker-compose (app, PostgreSQL 16, Redis 7)
 
@@ -71,6 +79,7 @@ Readiness (checks Postgres + Redis): `GET /health/ready`.
 | `make typecheck`   | Run mypy                                             |
 | `make up`          | Start app + Postgres + Redis via Docker Compose      |
 | `make down`        | Stop the Docker Compose stack                        |
+| `make rotate-key`  | Re-encrypt PHI columns onto a new key version (see "Key rotation") |
 
 ## Configuration
 
@@ -100,6 +109,10 @@ All configuration is environment-driven (`app/config.py`), loaded via
   `NOTE_MAX_RETRIES` / `NOTE_TIMEOUT_SECONDS` / `NOTE_SCRUB_ENABLED` /
   `NOTE_PROMPT_VERSION` / `NOTE_TRACING_ENABLED` / `LANGFUSE_HOST`: SOAP
   note generation — see "SOAP note generation" below.
+- `KEY_PROVIDER` (`local` | `aws_kms`) / `LOCAL_ENCRYPTION_KEY` /
+  `KMS_KEY_ID` / `ENCRYPTION_KEY_VERSION`, `ENFORCE_TLS` /
+  `TRUST_PROXY_HEADERS`, `ALLOW_BLANKET_RETENTION`: the Phase 7 HIPAA
+  controls — see "HIPAA controls" below.
 
 ## Auth
 
@@ -475,6 +488,194 @@ refuses to start if it looks like Langfuse Cloud, because tracing would
 otherwise send transcript/note PHI to a third party. No tracing SDK is
 wired in yet; `app/notes/openai.py`'s `_trace_generation` is a PHI-safe
 (metadata only) no-op hook point for a later phase.
+
+## HIPAA controls
+
+`app/security/` (Phase 7) hardens what Phases 1-6 built — no new product
+surface. Five things, each addressed below: field-level encryption at
+rest, TLS in transit, PHI *read* access auditing, a centralized consent
+gate before retention, and a fail-fast startup self-check.
+
+### Field-level encryption (`app/security/`)
+
+Envelope encryption, AES-256-GCM (authenticated — tampering is detected,
+not silently accepted): every encrypted value gets its own random
+256-bit data-encryption key (DEK), used once to encrypt that value; the
+DEK is then wrapped (encrypted) by a `KeyProvider`'s key-encryption key
+(KEK) and stored alongside the ciphertext in one self-describing blob —
+`{key_version, wrapped_dek, nonce, ciphertext}`, base64-encoded behind a
+`phi-enc-v1:` marker (`app/security/encryption.py`). The KEK never
+touches plaintext PHI directly, only ever wraps/unwraps per-value DEKs.
+
+`KeyProvider` (`app/security/keys.py`) has two implementations, selected
+by `KEY_PROVIDER`: `LocalKeyProvider` (`local`, the default — a static
+key from `LOCAL_ENCRYPTION_KEY`, no AWS needed, the only one the test
+suite exercises) and `AwsKmsProvider` (`aws_kms`, production — lazily
+imports `boto3`, never exercised in CI, refused at both this factory and
+`app/security/startup_checks.py` whenever `ENV=prod` still has
+`KEY_PROVIDER=local`).
+
+**PHIText is the seam.** Phase 2 reserved `PHIText` (`app/db/types.py`)
+as a plain `Text` pass-through specifically so encryption could swap in
+later without touching call sites or migrating each table separately —
+it's now `EncryptedText`, so every existing `PHIText` column encrypts
+automatically. `transcripts.segments` (structured JSONB, not text) uses
+the parallel `EncryptedJSON` type, which serializes to JSON text first —
+its SQL column type changed from `JSONB` to `Text` in migration
+`e545adfa522b`, since Postgres can no longer validate encrypted content
+as JSON.
+
+**Encrypted columns**: `transcripts.content`, `transcripts.segments`,
+`notes.subjective`/`objective`/`assessment`/`plan`/`full_text`,
+`sessions.patient_ref`, `users.mfa_secret` — every column that can hold
+PHI or a PHI-adjacent secret.
+
+**Not encrypted: `users.email`.** It's workforce login data (not patient
+PHI) used to look up which practice a login belongs to
+(`app/api/auth.py`'s login flow) and enforced unique at the database
+level — both require it to be plaintext and indexable. Encrypting it
+would make login require decrypting every user row to find a match (or
+an HMAC blind index — a deterministic keyed hash stored alongside the
+encrypted value, matched by hash instead of plaintext) — not implemented
+here; documented as the option if this changes. **General rule: an
+encrypted column cannot be indexed, filtered, or searched by Postgres**
+— nothing in this schema encrypts a column anything queries by.
+
+**Legacy-data tolerance**: `decrypt_value` treats any stored value
+*without* the `phi-enc-v1:` prefix as legacy, pre-encryption plaintext
+and returns it unchanged, rather than erroring — this is what lets
+migration `e545adfa522b`'s data-migration step (which encrypts every
+existing plaintext PHI value in place, table by table) run safely
+against a mix of already-migrated and not-yet-migrated rows, and be
+re-run/resumed. Dev/test databases are synthetic and typically empty at
+migration time, so reseeding is equally valid there (see
+`tests/conftest.py`); this path is for anywhere with real existing rows.
+
+**Key rotation** (`scripts/rotate_encryption_key.py`, `make rotate-key`):
+moves every value from an old key version to a new one — decrypt with
+old, re-encrypt with new — skipping rows already on the new version
+(safe to resume) and legacy unencrypted rows (not its job). Needs
+`ROTATE_OLD_KEY_VERSION` / `ROTATE_OLD_LOCAL_ENCRYPTION_KEY` /
+`ROTATE_NEW_KEY_VERSION` / `ROTATE_NEW_LOCAL_ENCRYPTION_KEY` in the
+environment (deliberately not part of `Settings` — the running app
+should never hold two keys at once; a rotation, briefly, does). Add
+`ARGS=--dry-run` to preview. Not "live" (no batching for a huge table,
+no online cutover coordination) — the straightforward, correct path,
+documented rather than built further since nothing here has that scale
+yet. `LocalKeyProvider` accepts multiple key versions at once
+specifically so a provider mid-rotation (or this script itself) can
+decrypt values still on the old version and values already on the new
+one simultaneously.
+
+**At-rest, infrastructure level**: field-level encryption above is the
+*application* layer — it holds regardless of what the database or its
+backups are doing. Infra-level at-rest encryption (RDS encryption, S3
+SSE-KMS, encrypted EBS/backups) is a separate, equally required control
+that belongs in the infra/Terraform layer, not this codebase; the app
+must never assume unencrypted storage is an acceptable fallback.
+
+### TLS enforcement and security headers (`app/security/transport.py`)
+
+`TLSEnforcementMiddleware` is a pure ASGI middleware (deliberately not
+Starlette's `BaseHTTPMiddleware`, which never sees `websocket` scope at
+all) so it covers both HTTP requests and WebSocket handshakes. Governed
+by `ENFORCE_TLS` (default `true`; `.env.example` turns it off for local
+HTTP dev): an insecure HTTP request gets a flat `400`, never a redirect
+(a redirect still has to be sent over the insecure connection first,
+exactly the exposure this closes); an insecure (`ws://`, not `wss://`)
+WebSocket handshake is closed with code `4400` before ever being
+accepted. Behind a TLS-terminating load balancer, the app only sees
+plain HTTP/WS itself — `TRUST_PROXY_HEADERS` (default `false`) opts in
+to trusting `X-Forwarded-Proto` for the "was this actually HTTPS"
+determination; leave it off unless a deployment genuinely sits behind a
+proxy that sets that header itself and strips any client-supplied copy.
+
+`SecurityHeadersMiddleware` adds baseline headers to every HTTP response
+(`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer`) and, whenever `ENFORCE_TLS` is on, HSTS
+(`max-age=63072000; includeSubDomains`) — omitted when TLS isn't being
+enforced, since an HSTS header over a connection that isn't guaranteed
+HTTPS is actively misleading.
+
+### PHI read-access auditing (`app/services/audit_service.py`)
+
+Phase 2 audited writes and made `audit_logs` immutable (still enforced
+both at the ORM level and via `REVOKE UPDATE, DELETE` at the database
+level — see "Immutable audit log" below). HIPAA requires logging PHI
+*access* — reads too. `record_phi_access` is the one choke point for
+both; `app/services/transcription_service.py`'s `record_ingestion_event`
+(the name the Phase 5/6 call sites already used) is now a thin wrapper
+around it, so existing write-audit call sites needed no changes.
+
+Call it once per **logical operation**, never per decrypted field —
+`app/security/encrypted_type.py`'s TypeDecorators are deliberately *not*
+the hook point: that fires once per column per row, which would be noisy
+and isn't what access logging is for. `app/services/note_service.py`'s
+`generate_note_for_session` is the concrete example: it reads the stored
+transcript before generating a note from it, and that read is audited
+(`action=read, resource_type="transcript"`) exactly like a write, with
+PHI-free metadata and `ip_address`/`user_agent` captured from the
+request where one is available (`request_meta_from_request`). A
+lightweight static guard (`tests/test_phi_access_audit_guard.py`)
+AST-scans the service layer for functions that fetch a `Transcript`/
+`Note` row without also referencing an audit call anywhere in their
+body — a heuristic, backed by the real behavioral test in
+`tests/test_note_service.py`.
+
+### Consent gate (`app/security/consent.py`)
+
+`ConsentService.assert_retention_allowed` is the single authority
+deciding whether transcript/note PHI may be persisted — it replaces the
+per-caller discretion Phases 5 and 6 used to each resolve independently
+(Phase 6's note persistence didn't gate retention *at all* before this).
+Both `app/services/transcription_service.py`'s `persist_transcript` and
+`app/services/note_service.py`'s `_persist_success`/`_persist_degraded`
+call it before writing. Policy is `TRANSCRIPT_RETENTION_DEFAULT`:
+`"none"` never retains; `"consented"` (default) retains only with an
+explicit granted `Consent` (type `recording` or `retention`) scoped to
+the session or the whole practice; `"always"` retains unconditionally
+**but requires the explicit `ALLOW_BLANKET_RETENTION` opt-in** — for a
+practice under a genuine signed blanket retention agreement, never as a
+convenient default. **Risk**: `"always"` bypasses the per-session
+consent check entirely; `app/security/startup_checks.py` additionally
+refuses to boot with `PHI_MODE=real`, this policy, and no opt-in.
+
+When retention isn't allowed, `Transcript`/`Note` rows are still created
+(so "does one exist" stays meaningful and re-finalizing stays
+idempotent) but with empty/`None` content and `is_retained=False` — the
+caller who just generated that content still gets the real thing back in
+the HTTP response; only what's persisted is gated. The decision itself
+is audited (`AuditAction.retention_skipped`, PHI-free) alongside the
+`create` audit entry, whichever way it goes.
+
+`ConsentService.assert_training_allowed` is the training-data
+belt-and-suspenders: no model-training/improvement path exists anywhere
+in this codebase yet, but any future one MUST call this (requiring an
+explicit granted `Consent(training)`) *in addition to*, never instead
+of, the vendor BAA/Zero-Data-Retention guarantee already required for
+`TRANSCRIBER_VENDOR=openai`/`NOTE_GENERATOR_VENDOR=openai`.
+
+### Startup self-check (`app/security/startup_checks.py`)
+
+`run_startup_safety_checks(settings)` runs in `app/main.py`'s lifespan
+before vendor selection or serving any traffic — raising aborts FastAPI's
+startup, crashing the process with a non-zero exit. **Refuses to start
+when:**
+
+- `ENV=prod` and `DEBUG=true` (Phase 1's rule, re-asserted here as
+  defense in depth alongside `Settings`' own validator).
+- `ENV=prod` and `PHI_MODE=synthetic`.
+- `PHI_MODE=real` and any of: `KEY_PROVIDER=local`; `TRANSCRIBER_VENDOR`
+  or `NOTE_GENERATOR_VENDOR` is `mock`; either is `openai` with no
+  `OPENAI_API_KEY`; `ENFORCE_TLS=false`; (`ENV=prod` and) `ENFORCE_TLS`
+  is on but `TRUST_PROXY_HEADERS` is off (every request would be
+  incorrectly rejected behind a TLS-terminating load balancer);
+  `TRANSCRIPT_RETENTION_DEFAULT=always` without `ALLOW_BLANKET_RETENTION`.
+
+On success, it logs a single PHI-free "HIPAA controls engaged" banner —
+which provider/vendor/policy is selected for every control above, never
+key material or API keys — so it's obvious at a glance, in production
+startup logs, what's actually active rather than assumed.
 
 ## Logging and PHI
 

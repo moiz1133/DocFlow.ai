@@ -34,6 +34,11 @@ os.environ.setdefault(
 )
 os.environ.setdefault("REDIS_URL", "redis://localhost:6380/0")
 os.environ.setdefault("ENV", "dev")
+# KEY_PROVIDER defaults to "local", which needs this — a fixed dev/test
+# key (not a secret; never used outside this test session and the local
+# .env.example) so every test in the session encrypts/decrypts
+# consistently. See app/security/keys.py.
+os.environ.setdefault("LOCAL_ENCRYPTION_KEY", "TlGtLjbjLbojhmM71ihT1kx4TUJaVXUARSqQqA9gwBY=")
 
 import pytest
 import pytest_asyncio

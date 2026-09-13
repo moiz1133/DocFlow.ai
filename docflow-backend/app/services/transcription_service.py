@@ -25,10 +25,12 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.db.session import get_sessionmaker, set_tenant
-from app.models import AuditLog, Consent, EncounterSession, Transcript
-from app.models.enums import AuditAction, ConsentType, SessionStatus
+from app.models import EncounterSession, Transcript
+from app.models.enums import AuditAction, SessionStatus
+from app.security.consent import ConsentService
+from app.services.audit_service import RequestMeta, record_phi_access
 from app.transcription.base import (
     AudioChunk,
     TranscriptionAuthError,
@@ -167,37 +169,6 @@ class StreamAggregate:
 
 
 # ---------------------------------------------------------------------------
-# Retention gating
-# ---------------------------------------------------------------------------
-
-
-async def _resolve_retention(
-    db: AsyncSession, *, session_id: uuid.UUID, settings: Settings
-) -> bool:
-    """Whether the transcript content for this session may be retained.
-
-    See Settings.TRANSCRIPT_RETENTION_DEFAULT. "consented" (the default)
-    requires an explicit, granted ConsentType.retention record scoped to
-    this session or to the whole practice (session_id IS NULL) — retention
-    is never implied merely by the transcript existing (see
-    app/models/transcript.py).
-    """
-    if settings.TRANSCRIPT_RETENTION_DEFAULT == "none":
-        return False
-    if settings.TRANSCRIPT_RETENTION_DEFAULT == "always":
-        return True
-
-    result = await db.execute(
-        select(Consent.id).where(
-            Consent.consent_type == ConsentType.retention,
-            Consent.granted.is_(True),
-            (Consent.session_id == session_id) | (Consent.session_id.is_(None)),
-        )
-    )
-    return result.first() is not None
-
-
-# ---------------------------------------------------------------------------
 # Audit logging
 # ---------------------------------------------------------------------------
 
@@ -211,21 +182,27 @@ async def record_ingestion_event(
     resource_type: str,
     resource_id: uuid.UUID | None,
     metadata: dict[str, object] | None = None,
+    request_meta: RequestMeta | None = None,
 ) -> None:
     """PHI-free audit entry for a session/transcript lifecycle event. Never
     pass transcript text or audio here — see app/models/audit_log.py.
+
+    A thin, historically-named wrapper around
+    app/services/audit_service.py's record_phi_access (the Phase 7 choke
+    point covering reads too, not just writes) — kept so the existing
+    call sites in this module and app/api/sessions.py don't need to
+    change.
     """
-    db.add(
-        AuditLog(
-            practice_id=practice_id,
-            actor_user_id=actor_user_id,
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            metadata_=metadata,
-        )
+    await record_phi_access(
+        db,
+        practice_id=practice_id,
+        actor_user_id=actor_user_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        metadata=metadata,
+        request_meta=request_meta,
     )
-    await db.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +233,7 @@ async def persist_transcript(
     should build their client-facing response from THOSE, not from the
     row this returns — see app/api/sessions.py's finalize route.
     """
-    settings = get_settings()
-    is_retained = await _resolve_retention(db, session_id=session_id, settings=settings)
+    is_retained = await ConsentService.assert_retention_allowed(db, session_id=session_id)
 
     stored_content = full_text if is_retained else ""
     stored_segments = [segment.to_jsonb() for segment in segments] if is_retained else []
@@ -292,6 +268,17 @@ async def persist_transcript(
             "segment_count": len(segments),
         },
     )
+    if not is_retained:
+        # A distinct decision audit alongside transcript.created (above)
+        # — see app/security/consent.py's module docstring.
+        await record_ingestion_event(
+            db,
+            practice_id=practice_id,
+            actor_user_id=actor_user_id,
+            action=AuditAction.retention_skipped,
+            resource_type="transcript",
+            resource_id=transcript.id,
+        )
     return transcript
 
 

@@ -68,3 +68,8 @@ class AuditAction(str, enum.Enum):
     # (resource_type="note"); note.degraded is kept distinct since it
     # marks a materially different outcome — a stub, not a real note.
     note_degraded = "note_degraded"
+    # HIPAA controls (Phase 7): the consent gate (see
+    # app/security/consent.py) denied retention for a transcript/note —
+    # distinct from note_degraded (an LLM failure) since this is a
+    # policy decision, not an error.
+    retention_skipped = "retention_skipped"

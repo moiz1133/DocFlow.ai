@@ -38,3 +38,9 @@ class Note(Base, UUIDPKMixin, TenantMixin, TimestampMixin):
     provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # Phase 7 — same retention gate as Transcript.is_retained: never
+    # implied by the row merely existing. See
+    # app/security/consent.py's ConsentService.assert_retention_allowed,
+    # the single authority both Transcript and Note persistence defer to.
+    is_retained: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
