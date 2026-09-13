@@ -138,6 +138,45 @@ class Settings(BaseSettings):
     NOTE_TRACING_ENABLED: bool = False
     LANGFUSE_HOST: str | None = None
 
+    # --- Phase 7: HIPAA controls --------------------------------------
+
+    # Field-level PHI encryption — see app/security/keys.py and
+    # app/security/encryption.py. "local" (default) needs no AWS and is
+    # the only provider the test suite exercises; "aws_kms" is the
+    # production path (refused with ENV=prod + KEY_PROVIDER=local, same
+    # guardrail shape as the vendor factories).
+    KEY_PROVIDER: Literal["local", "aws_kms"] = "local"
+    # Base64-encoded 32-byte AES-256 key. Dev/test only — deliberately no
+    # default value here (unlike e.g. NOTE_PROMPT_VERSION): a shared
+    # hardcoded key would defeat the point. Required when KEY_PROVIDER
+    # stays "local" (its default), same as SECRET_KEY/JWT_SECRET.
+    LOCAL_ENCRYPTION_KEY: str | None = None
+    KMS_KEY_ID: str | None = None
+    # Bumped when rotating keys — see scripts/rotate_encryption_key.py
+    # and README's "Key rotation" section. Stamped into every new
+    # encrypted blob; existing blobs keep decrypting under whatever
+    # version they were written with.
+    ENCRYPTION_KEY_VERSION: int = 1
+
+    # TLS enforcement (app/security/transport.py). Default True: a
+    # deployer has to opt OUT for local dev (.env.example does), not opt
+    # in for prod. TRUST_PROXY_HEADERS controls whether X-Forwarded-Proto
+    # from a terminating load balancer is trusted to mean "this request
+    # arrived over HTTPS" — default False (don't trust a header that's
+    # trivially spoofable unless a deployment explicitly confirms it sits
+    # behind a proxy that sets it correctly and strips any client-supplied
+    # copy).
+    ENFORCE_TLS: bool = True
+    TRUST_PROXY_HEADERS: bool = False
+
+    # Consent gate (app/security/consent.py). TRANSCRIPT_RETENTION_DEFAULT
+    # ="always" retains unconditionally for every session/practice with no
+    # per-session consent check at all — a real compliance risk (blanket
+    # retention without a signed agreement backing it) — so it additionally
+    # requires this explicit opt-in, checked both here at request time
+    # (ConsentService) and at startup (app/security/startup_checks.py).
+    ALLOW_BLANKET_RETENTION: bool = False
+
     @field_validator("CORS_WEB_ORIGINS", "CORS_EXTENSION_ORIGINS", mode="before")
     @classmethod
     def _parse_csv_origins(cls, value: object) -> object:

@@ -168,11 +168,16 @@ async def test_finalize_writes_transcript_created_audit_entry(
     async with admin_sessionmaker() as session:
         result = await session.execute(
             select(AuditLog).where(
-                AuditLog.resource_type == "transcript", AuditLog.resource_id == transcript.id
+                AuditLog.resource_type == "transcript",
+                AuditLog.resource_id == transcript.id,
+                AuditLog.action == "create",
             )
         )
         audit_rows = result.scalars().all()
 
+    # Also expect a retention_skipped decision audit alongside this one
+    # (Phase 7's consent gate — no consent exists in this test) — scoped
+    # out here since this assertion is specifically about transcript.created.
     assert len(audit_rows) == 1
     assert audit_rows[0].action.value == "create"
     assert audit_rows[0].metadata_ is not None

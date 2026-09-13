@@ -5,12 +5,13 @@ Phase 5 session resource with one more sub-resource: its generated note).
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.auth.dependencies import get_current_user
 from app.models import User
 from app.models.enums import NoteStatus
+from app.services.audit_service import request_meta_from_request
 from app.services.note_service import (
     SessionNotFoundError,
     TranscriptNotReadyError,
@@ -30,13 +31,19 @@ class NoteOut(BaseModel):
     # On success this is the composed SOAP text; when degraded=True, this
     # is the raw transcript — see app/services/note_service.py's
     # DEGRADATION POLICY. Either way, the caller always has something
-    # readable here.
+    # readable here, regardless of is_retained (see below).
     full_text: str | None
     provider: str | None
     model: str | None
     prompt_version: str | None
     version: int
     degraded: bool
+    # Whether this content was actually written to the notes table (the
+    # Phase 7 consent gate — app/security/consent.py). False means the
+    # persisted row is a minimal stub; this response still carries the
+    # real content regardless, same convention as Phase 5's
+    # TranscriptOut.is_retained.
+    is_retained: bool
 
 
 class GenerateNoteResponse(BaseModel):
@@ -47,6 +54,7 @@ class GenerateNoteResponse(BaseModel):
 @router.post("/{session_id}/note")
 async def generate_note(
     session_id: uuid.UUID,
+    request: Request,
     user: Annotated[User, Depends(get_current_user)],
 ) -> GenerateNoteResponse:
     """Triggers SOAP note generation for a session with a completed
@@ -62,7 +70,10 @@ async def generate_note(
     """
     try:
         result = await generate_note_for_session(
-            session_id=session_id, practice_id=user.practice_id, actor_user_id=user.id
+            session_id=session_id,
+            practice_id=user.practice_id,
+            actor_user_id=user.id,
+            request_meta=request_meta_from_request(request),
         )
     except SessionNotFoundError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found") from None
@@ -71,21 +82,24 @@ async def generate_note(
             status.HTTP_409_CONFLICT, "No transcript available for this session yet"
         ) from None
 
-    note = result.note
+    # Built from the service result's independent in-memory fields, NOT
+    # from result.note's columns — those are gated empty when
+    # is_retained is False (see NoteGenerationResult's docstring).
     return GenerateNoteResponse(
         note=NoteOut(
-            id=note.id,
-            status=note.status,
-            subjective=note.subjective,
-            objective=note.objective,
-            assessment=note.assessment,
-            plan=note.plan,
-            full_text=note.full_text,
-            provider=note.provider,
-            model=note.model,
-            prompt_version=note.prompt_version,
-            version=note.version,
-            degraded=note.degraded,
+            id=result.note.id,
+            status=result.note.status,
+            subjective=result.subjective,
+            objective=result.objective,
+            assessment=result.assessment,
+            plan=result.plan,
+            full_text=result.full_text,
+            provider=result.provider,
+            model=result.model,
+            prompt_version=result.note.prompt_version,
+            version=result.note.version,
+            degraded=result.degraded,
+            is_retained=result.is_retained,
         ),
         degraded=result.degraded,
     )

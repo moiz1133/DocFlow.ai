@@ -1,4 +1,4 @@
-.PHONY: install run test lint format typecheck up down db-up redis-up migrate-up migrate-down seed
+.PHONY: install run test lint format typecheck up down db-up redis-up migrate-up migrate-down seed rotate-key
 
 install:
 	uv sync
@@ -36,6 +36,13 @@ migrate-down: db-up
 
 seed: db-up
 	uv run python scripts/seed.py
+
+# Requires ROTATE_OLD_KEY_VERSION / ROTATE_OLD_LOCAL_ENCRYPTION_KEY /
+# ROTATE_NEW_KEY_VERSION / ROTATE_NEW_LOCAL_ENCRYPTION_KEY in the
+# environment — see scripts/rotate_encryption_key.py's module docstring.
+# Pass ARGS=--dry-run to preview without writing.
+rotate-key: db-up
+	uv run python scripts/rotate_encryption_key.py $(ARGS)
 
 up:
 	docker compose up --build

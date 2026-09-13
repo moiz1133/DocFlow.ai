@@ -116,10 +116,15 @@ async def test_happy_path_generates_a_valid_note_and_completes_session(
     async with admin_sessionmaker() as session:
         result = await session.execute(
             select(AuditLog).where(
-                AuditLog.resource_type == "note", AuditLog.resource_id == uuid.UUID(note["id"])
+                AuditLog.resource_type == "note",
+                AuditLog.resource_id == uuid.UUID(note["id"]),
+                AuditLog.action == "create",
             )
         )
         audit_rows = result.scalars().all()
+    # Also expect a retention_skipped decision audit alongside this one
+    # (Phase 7's consent gate — no consent exists in this test) — scoped
+    # out here since this assertion is specifically about note.created.
     assert len(audit_rows) == 1
     assert audit_rows[0].action.value == "create"
     assert audit_rows[0].metadata_ == {
@@ -128,7 +133,50 @@ async def test_happy_path_generates_a_valid_note_and_completes_session(
         "prompt_version": "soap_primary_care_v1",
         "retry_count": 0,
         "degraded": False,
+        "is_retained": False,
     }
+
+
+async def test_note_generation_audits_the_transcript_read(
+    client: AsyncClient, admin_sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    """HIPAA requires auditing PHI *reads*, not just writes (Phase 7) —
+    generate_note_for_session reads the stored transcript before ever
+    calling the note generator, and that read must be audited exactly
+    like a write is, with PHI-free metadata and ip/user-agent captured
+    from the request.
+    """
+    headers, practice_id, user_id = await _owner_ids(client)
+    session_id = await _seed_completed_session(
+        admin_sessionmaker,
+        practice_id=practice_id,
+        clinician_id=user_id,
+        transcript_text="I've had a mild headache and some fatigue for about three days now.",
+    )
+
+    response = await client.post(f"/v1/sessions/{session_id}/note", headers=headers)
+    assert response.status_code == 200, response.text
+
+    async with admin_sessionmaker() as session:
+        result = await session.execute(
+            select(Transcript.id).where(Transcript.session_id == session_id)
+        )
+        transcript_id = result.scalar_one()
+
+        audit_result = await session.execute(
+            select(AuditLog).where(
+                AuditLog.resource_type == "transcript",
+                AuditLog.resource_id == transcript_id,
+                AuditLog.action == "read",
+            )
+        )
+        read_rows = audit_result.scalars().all()
+
+    assert len(read_rows) == 1
+    assert read_rows[0].metadata_ == {"purpose": "note_generation"}
+    assert read_rows[0].actor_user_id == user_id
+    # PHI-free: no transcript text anywhere in the audit metadata.
+    assert "headache" not in str(read_rows[0].metadata_)
 
 
 async def test_retry_succeeds_and_records_retry_count(
