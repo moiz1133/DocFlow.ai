@@ -73,3 +73,9 @@ class AuditAction(str, enum.Enum):
     # distinct from note_degraded (an LLM failure) since this is a
     # policy decision, not an error.
     retention_skipped = "retention_skipped"
+    # Hardening/operations (Phase 8): one row per practice per scheduled
+    # retention-purge run (app/worker/tasks.py's purge_expired_data_task)
+    # — system-initiated (actor_user_id is None), metadata is PHI-free
+    # counts only. Never emitted for audit_logs itself, which the purge
+    # job never touches — see that module's docstring.
+    purge_completed = "purge_completed"

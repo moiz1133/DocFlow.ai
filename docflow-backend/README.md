@@ -28,6 +28,16 @@ Backend for DocFlow.ai, an ambient AI medical scribe.
   writes), a centralized consent gate before any retention, and a
   fail-fast startup self-check that refuses to boot a misconfigured
   `PHI_MODE=real` deployment. Hardens Phases 1-6; no new product surface.
+- **Phase 8** (done): hardening and operations — a central Redis-backed
+  rate limiter (`app/ops/ratelimit.py`) across auth, session, and note
+  routes plus WS connection establishment; PHI-free, cardinality-safe
+  Prometheus metrics (`GET /metrics`); a real self-hosted-only Langfuse
+  integration for note-generation tracing (`app/ops/tracing.py`); SOAP
+  note generation moved off the request thread onto a Celery worker
+  (`app/worker/`), with `POST /v1/sessions/{id}/note` now enqueuing and
+  `GET /v1/sessions/{id}/note` polling; and a scheduled retention-purge
+  job that makes zero/consented retention true over time, not just at
+  write time. Hardens/operationalizes Phases 1-7; no new product surface.
 
 Full business routes (note editing/finalization, patient-facing views)
 land in later phases.
@@ -45,8 +55,12 @@ land in later phases.
 - WebSockets (FastAPI/Starlette native) for live audio streaming
 - `cryptography` (AES-256-GCM envelope encryption — `app/security/`);
   `boto3` optional/lazy, only for the AWS KMS key provider in production
+- Celery (Redis broker/result backend) for async note generation and the
+  scheduled retention-purge job (`app/worker/`)
+- `prometheus-client` for `GET /metrics`; `langfuse` (self-hosted only,
+  lazily imported — `app/ops/tracing.py`) for LLM tracing
 - Ruff, mypy, pytest for dev tooling; `httpx-ws` for WS integration tests
-- Docker + docker-compose (app, PostgreSQL 16, Redis 7)
+- Docker + docker-compose (app, worker, beat, PostgreSQL 16, Redis 7)
 
 ## Local development
 
@@ -80,6 +94,8 @@ Readiness (checks Postgres + Redis): `GET /health/ready`.
 | `make up`          | Start app + Postgres + Redis via Docker Compose      |
 | `make down`        | Stop the Docker Compose stack                        |
 | `make rotate-key`  | Re-encrypt PHI columns onto a new key version (see "Key rotation") |
+| `make worker`      | Run a Celery worker (`generate_note_task`) — starts Postgres + Redis first |
+| `make beat`        | Run Celery beat (schedules `purge_expired_data_task`) — starts Postgres + Redis first |
 
 ## Configuration
 
@@ -113,6 +129,13 @@ All configuration is environment-driven (`app/config.py`), loaded via
   `KMS_KEY_ID` / `ENCRYPTION_KEY_VERSION`, `ENFORCE_TLS` /
   `TRUST_PROXY_HEADERS`, `ALLOW_BLANKET_RETENTION`: the Phase 7 HIPAA
   controls — see "HIPAA controls" below.
+- `RATELIMIT_ENABLED` + per-bucket `RATELIMIT_*_LIMIT`/`RATELIMIT_*_WINDOW_SECONDS`,
+  `METRICS_ENABLED` / `METRICS_AUTH_TOKEN`, `LANGFUSE_PUBLIC_KEY` /
+  `LANGFUSE_SECRET_KEY` / `TRACE_INCLUDE_CONTENT`, `CELERY_BROKER_URL` /
+  `CELERY_RESULT_BACKEND`, `PURGE_UNRETAINED_AFTER` /
+  `PURGE_ORPHAN_SESSION_AFTER` / `PURGE_INTERVAL` / `PURGE_DRY_RUN`: the
+  Phase 8 hardening/operations controls — see "Hardening and operations"
+  below.
 
 ## Auth
 
@@ -194,9 +217,12 @@ user who hasn't opted in. Flow:
 
 ### Rate limiting
 
-`/login` and `/refresh` are rate-limited per client IP via a Redis fixed
-window (`app/auth/rate_limit.py`) — lenient today (30 requests/minute),
-but the hook is real: tightening it is a config change, not new plumbing.
+`/login` and `/refresh` are rate-limited per client IP via the central
+Redis-backed limiter (`app/ops/ratelimit.py`, Phase 8's consolidation of
+the earlier Phase 3 stub) — lenient today, but the hook is real:
+tightening any bucket is a config change, not new plumbing. See
+"Hardening and operations" below for the full rate-limiting picture
+(other routes, WS connect limiting, `Retry-After`).
 
 ### Audit trail
 
@@ -392,9 +418,12 @@ three ways: `pyproject.toml`'s banned-api rule, the factory's lazy
 `openai` import, and `tests/test_transcription_isolation.py` (the shared
 full-tree AST scan, now allowlisting both `app/transcription/openai.py`
 and `app/notes/openai.py`) plus `tests/test_notes_isolation.py` (the
-notes-specific dynamic check). `app/services/note_service.py` and
-`app/api/notes.py` (`POST /v1/sessions/{id}/note`) wire it to a Phase 5
-transcript. Specialty is locked to Primary Care, format to SOAP.
+notes-specific dynamic check). `app/services/note_service.py` wires it
+to a Phase 5 transcript; since Phase 8, `app/api/notes.py`'s
+`POST /v1/sessions/{id}/note` no longer calls it directly — it enqueues
+a Celery task instead. See "Hardening and operations" below for the
+async enqueue/poll flow. Specialty is locked to Primary Care, format to
+SOAP.
 
 ### The interface (`app/notes/base.py`)
 
@@ -447,16 +476,31 @@ produced) — it never returns a partial or invalid note.
 `app/services/note_service.py`'s **DEGRADATION POLICY** catches that:
 the visit is never lost. A `Note` stub is persisted (`status=draft`,
 `degraded=True`, all four SOAP sections `None`, `full_text` set to the
-**raw transcript**) so `POST /v1/sessions/{id}/note`'s response always
-has something the clinician can read in `note.full_text` — the transcript
-itself when degraded, the composed SOAP text otherwise. The session moves
-to `SessionStatus.complete_degraded` (a new enum value, migration
-`6e70ea786d86`) rather than `complete`, so a session list can tell "note
-ready" apart from "needs manual note writing" without joining `notes`.
-Audit entries, same style as Phase 5's: `note.created` (`action=create`,
-`resource_type="note"`) on success, `note.degraded` (a new `AuditAction`
-value) on degradation — both PHI-free (provider, model, `prompt_version`,
-`retry_count`, `degraded` — never note/transcript text).
+**raw transcript**) so a poller reading `GET /v1/sessions/{id}/note`
+always has something to read in `note.full_text` — the transcript itself
+when degraded, the composed SOAP text otherwise — **provided retention
+consent allowed it to be persisted at all** (see the Phase 8 note below).
+The session moves to `SessionStatus.complete_degraded` (a new enum
+value, migration `6e70ea786d86`) rather than `complete`, so a session
+list can tell "note ready" apart from "needs manual note writing"
+without joining `notes`. Audit entries, same style as Phase 5's:
+`note.created` (`action=create`, `resource_type="note"`) on success,
+`note.degraded` (a new `AuditAction` value) on degradation — both
+PHI-free (provider, model, `prompt_version`, `retry_count`, `degraded` —
+never note/transcript text).
+
+**Phase 8 change**: before Phase 8, `POST /v1/sessions/{id}/note` ran
+generation synchronously and its HTTP response always carried the real
+content regardless of `is_retained` (retention only governed what got
+*written*, never what the caller who just triggered generation was
+*told*). Now that generation happens on a worker and the result is only
+ever read back via `GET .../note`, that guarantee can't hold — a poller
+can only ever see what actually made it into the `notes` table. When
+`is_retained` is `false`, `GET .../note` legitimately returns empty
+sections (including `full_text`, even on a degraded outcome) once
+generation finishes. This is an inherent consequence of async processing
+plus zero/consented retention, not a bug — see `app/api/notes.py`'s
+module docstring for the full reasoning.
 
 ### Prompt versioning (`app/notes/prompts/soap_primary_care_v1.py`)
 
@@ -485,9 +529,16 @@ reasoning as `get_transcriber()`.
 Off by default (`NOTE_TRACING_ENABLED=false`). If enabled, `LANGFUSE_HOST`
 must point at a **self-hosted** Langfuse instance — `app/config.py`
 refuses to start if it looks like Langfuse Cloud, because tracing would
-otherwise send transcript/note PHI to a third party. No tracing SDK is
-wired in yet; `app/notes/openai.py`'s `_trace_generation` is a PHI-safe
-(metadata only) no-op hook point for a later phase.
+otherwise send transcript/note PHI to a third party. Since Phase 8, this
+is a real integration (`app/ops/tracing.py`, `Tracer`/`get_tracer()`),
+wired at the `app/services/note_service.py` orchestration boundary —
+once per `generate_note_for_session()` call, not once per vendor retry
+attempt. See "Hardening and operations" below for the full picture
+(what a trace carries, `TRACE_INCLUDE_CONTENT`, and the three
+independent layers that refuse Langfuse Cloud).
+`app/notes/openai.py`'s own `_trace_generation` stays a separate,
+PHI-safe no-op hook for a possible future finer-grained (per-retry-
+attempt) trace — not used by the Phase 8 integration.
 
 ## HIPAA controls
 
@@ -642,10 +693,15 @@ refuses to boot with `PHI_MODE=real`, this policy, and no opt-in.
 
 When retention isn't allowed, `Transcript`/`Note` rows are still created
 (so "does one exist" stays meaningful and re-finalizing stays
-idempotent) but with empty/`None` content and `is_retained=False` — the
-caller who just generated that content still gets the real thing back in
-the HTTP response; only what's persisted is gated. The decision itself
-is audited (`AuditAction.retention_skipped`, PHI-free) alongside the
+idempotent) but with empty/`None` content and `is_retained=False` — only
+what's persisted is gated. For `Transcript` (still a synchronous request
+path), the caller who just submitted the audio still gets the real
+content back in that same HTTP response. For `Note`, since Phase 8 moved
+generation onto a worker (see "Hardening and operations" below), there
+is no synchronous response to carry real content in any more — a poller
+reading `GET /v1/sessions/{id}/note` genuinely only ever sees what made
+it into the table, gated content included. The decision itself is
+audited (`AuditAction.retention_skipped`, PHI-free) alongside the
 `create` audit entry, whichever way it goes.
 
 `ConsentService.assert_training_allowed` is the training-data
@@ -671,11 +727,189 @@ when:**
   is on but `TRUST_PROXY_HEADERS` is off (every request would be
   incorrectly rejected behind a TLS-terminating load balancer);
   `TRANSCRIPT_RETENTION_DEFAULT=always` without `ALLOW_BLANKET_RETENTION`.
+- (Phase 8) `NOTE_TRACING_ENABLED=true` with no self-hosted
+  `LANGFUSE_HOST` — re-asserts, independently, the same rule `Settings`'
+  own `_validate_tracing_is_self_hosted` validator already enforces at
+  construction time.
+- (Phase 8) `TRACE_INCLUDE_CONTENT=true` with `PHI_MODE=real` or
+  `ENV=prod` — same defense-in-depth re-assertion of `Settings`'
+  `_validate_trace_content_restricted` validator.
 
 On success, it logs a single PHI-free "HIPAA controls engaged" banner —
-which provider/vendor/policy is selected for every control above, never
-key material or API keys — so it's obvious at a glance, in production
+which provider/vendor/policy is selected for every control above (Phase
+8's rate limiting/metrics/tracing/purge settings included), never key
+material or API keys — so it's obvious at a glance, in production
 startup logs, what's actually active rather than assumed.
+
+## Hardening and operations
+
+Phase 8 hardens and operationalizes what Phases 1-7 built — no new
+product surface. Five things: rate limiting, metrics, LLM tracing, async
+note generation, and a scheduled retention-purge job.
+
+### Rate limiting (`app/ops/ratelimit.py`)
+
+A single central, Redis-backed, fixed-window limiter — replaces/
+consolidates the Phase 3 `/login`/`/refresh` stub. Keying: authenticated
+routes use `UserRateLimiter`, keyed `user:<id>:practice:<id>` (the limit
+travels with the account, not the network address — important once a
+whole clinic shares one IP/NAT); pre-auth routes (`/login`, `/refresh`)
+use `IpRateLimiter`, keyed `ip:<addr>` (there's no verified identity
+yet). A rejected request gets `429` with a `Retry-After` header. Limits
+live in Redis, which every app-server process/instance shares — they
+hold cluster-wide, not just within one process, so scaling `app`
+horizontally doesn't multiply any bucket's effective ceiling.
+
+Wired onto: `/login`, `/refresh` (stricter), session creation and note
+generation (moderate), plain reads (`GET .../{id}`, `GET .../note` —
+looser), and WebSocket `/stream` **connection establishment** — a client
+opening many concurrent/rapid streaming connections is throttled once,
+per connection attempt, never per audio frame within an already-open
+one. `RATELIMIT_ENABLED=false` bypasses the limiter entirely (useful for
+load testing); each bucket's limit/window is independently configurable
+via `RATELIMIT_<BUCKET>_LIMIT`/`RATELIMIT_<BUCKET>_WINDOW_SECONDS` — see
+`.env.example`.
+
+### Metrics (`app/api/metrics.py`, `app/ops/metrics.py`, `app/ops/http_metrics.py`)
+
+`GET /metrics` exposes Prometheus-format output: HTTP request
+count/latency by route template + method + status, in-flight request
+gauge, rate-limit-hit counter (by bucket), WS active-connection gauge +
+session-duration histogram, transcription/note-generation latency by
+provider + outcome, Celery task count/latency by task + outcome, and a
+purge-job rows-deleted counter by resource type.
+
+**Every label is drawn from a small, fixed, known-in-advance vocabulary
+— route template (never a raw path with an id substituted in), HTTP
+method, status code, vendor/provider name, task name, outcome.** Never a
+patient/session/transcript/user identifier or free text — see
+`app/ops/metrics.py`'s module docstring and `tests/test_metrics.py`,
+which asserts the exposition output contains no UUID anywhere.
+
+**Known scope boundary**: the Celery task and purge-job series live in
+the collector registry of whichever process incremented them. In tests
+(`task_always_eager`), that's the same process serving `/metrics`, so
+they show up correctly — `tests/test_metrics.py` asserts on exactly
+that. In `docker-compose.yml`'s real multi-container topology, `worker`/
+`beat` run as separate processes with no HTTP server of their own, so
+their metrics aren't currently scrapeable from `app`'s `/metrics`. A
+production deployment wanting worker-side series needs one of:
+`prometheus_client`'s official multiprocess mode (`PROMETHEUS_MULTIPROC_DIR`
++ file-based aggregation — the standard answer for a prefork pool with
+several child processes, each of which would otherwise fight over one
+port), or a lightweight `start_http_server(...)` call gated on Celery's
+`worker_process_init` signal if the worker runs with `--pool=solo`/
+`--pool=threads` (one process, no port conflict). Neither is wired in
+here — a deliberate line drawn given this phase's scope, not an
+oversight to silently work around.
+
+**Not a public endpoint.** `METRICS_AUTH_TOKEN`, when set, requires a
+matching `Authorization: Bearer <token>` header; when unset, this relies
+entirely on network policy (an internal-only ingress/firewall rule,
+scraped by an in-network Prometheus) to keep it off the public internet
+— see `docker-compose.yml`'s top-of-file comment for the scrape target.
+
+### LLM tracing
+
+See "SOAP note generation" → "LLM tracing" above for the self-hosted-
+only rule (three independent layers refuse Langfuse Cloud: a `Settings`
+validator, the startup self-check, and `app/ops/tracing.py`'s own
+client-construction guard). What a trace carries: `prompt_version`,
+provider, model, `retry_count`, `degraded`,
+`outcome`, latency, and transcript/note **character counts** — never the
+text itself, unless `TRACE_INCLUDE_CONTENT=true` (default `false`,
+refused at startup under `PHI_MODE=real` or `ENV=prod` — synthetic/dev
+prompt debugging only). A trace-backend failure never breaks note
+generation — emission errors are caught and logged, not raised.
+
+### Async note generation (`app/worker/`)
+
+`generate_note_task` (Celery, Redis broker/result backend on separate
+logical Redis DBs from `REDIS_URL`'s own) wraps
+`app/services/note_service.py`'s `generate_note_for_session` **with no
+rewrite of that function** — it was kept a plain async callable taking
+only UUIDs back in Phase 6/7 specifically so this move needed none. The
+task re-establishes RLS tenant context itself (`tenant_session`, same
+helper the WS handler already uses) since a worker process has no
+FastAPI request to inherit it from — a task enqueued for Practice A's
+session cannot touch Practice B's data, RLS-enforced exactly as any
+other code path. Task args are `str(uuid)` only, never PHI (Celery's
+result backend stores/can log task args).
+
+**Endpoint contract**: `POST /v1/sessions/{id}/note` validates the
+session is ready, marks it `generating`, enqueues the task, and returns
+`202 {task_id, status: "generating"}` immediately — it no longer runs
+generation on the request thread. `GET /v1/sessions/{id}/note` polls:
+`{status, note}`, where `status` mirrors the session's own lifecycle and
+`note` is populated once the session reaches `complete` or
+`complete_degraded`. Clients (extension/web/mobile) poll this route; a
+push mechanism (WS notification or webhook) is a natural future addition
+but out of scope here. See "SOAP note generation" above for how this
+changes what a poller can see when `is_retained=false`.
+
+**Idempotency**: before doing any work, the task checks whether a `Note`
+already exists for the session and skips (rather than regenerating) if
+so — safe against a duplicate enqueue or a Celery-level retry re-running
+after the underlying work already completed. **Retries**: bounded,
+jittered, and narrowly scoped to `TranscriptNotReadyError` (a
+legitimate, rare race against the finalize/WS-persist path still
+committing) — never `SessionNotFoundError` (the route already confirmed
+the session existed moments before enqueueing; a retry can't fix it
+having vanished since). Vendor-level retry/degradation is unchanged from
+Phase 6: it happens *inside* `generate_soap()`/`generate_note_for_session`
+before this task ever sees an exception — the degradation path (persist
+a stub, audit `note.degraded`) runs identically whether triggered from
+this task or (in tests) called directly.
+
+Run a worker with `make worker` (or `uv run celery -A
+app.worker.celery_app worker --loglevel=info`); `docker-compose.yml`'s
+`worker` service does the same, sharing the `app` image/environment so
+it always runs the exact same code. Scale it independently of the web
+tier: `docker compose up --scale worker=3`.
+
+### Retention purge (`app/worker/tasks.py`'s `purge_expired_data_task`)
+
+Consent/retention (`ConsentService`) only ever governs what gets
+persisted **at write time** — without a purge job, an unretained row
+that briefly existed before a client read it, or an abandoned/error
+session, would sit in the database forever. This Celery-beat-scheduled
+task (interval: `PURGE_INTERVAL`, default `1h`) is what makes
+zero/consented retention true *over time*.
+
+**Deletes**: `Transcript`/`Note` rows with `is_retained=false` older
+than `PURGE_UNRETAINED_AFTER` (default `24h`); orphaned/stale sessions
+(`created`/`recording`/`error` status, never reached a terminal state)
+older than `PURGE_ORPHAN_SESSION_AFTER` (default `24h`) — defensively
+skipped if the session still carries a *retained* transcript or note,
+even though both already CASCADE-delete with their session at the DB
+level, since purging retained clinical content via the "orphan" path
+would be a compliance bug, not cleanup; and expired `refresh_tokens`
+(`expires_at < now()` **only** — a revoked-but-not-yet-expired token is
+deliberately kept, since purging it early would defeat
+`app/auth/refresh_store.py`'s reuse-detection check, which depends on
+finding that row).
+
+**Never touches**: `audit_logs`. This task has no code path that
+imports or queries the `AuditLog` model at all beyond *writing* its own
+summary rows — and even a hypothetical future bug here couldn't delete
+one anyway, since the application DB role has `UPDATE`/`DELETE` revoked
+on that table at the database level (see "Immutable audit log" below).
+
+**Tenant scoping**: the admin/migration role is used only to enumerate
+which practices exist (the same narrow cross-tenant-listing exception
+documented on `app/db/session.py`'s `get_admin_engine`); every actual
+delete runs through `tenant_session`, RLS-scoped to one practice at a
+time, exactly like every other write path in this codebase — never a
+blanket cross-tenant `DELETE`.
+
+**Dry run by default** (`PURGE_DRY_RUN=true`): counts what *would* be
+deleted and writes the same PHI-free summary audit row, without deleting
+anything. Flip to `false` only after reviewing dry-run output. Either
+way, one `AuditAction.purge_completed` row is written **per practice per
+run** (`resource_type="purge"`, `actor_user_id=None` — system-initiated,
+metadata is counts only: `transcripts_deleted`, `notes_deleted`,
+`sessions_deleted`, `refresh_tokens_deleted`, `dry_run`) and one
+Prometheus counter increment per resource type actually purged.
 
 ## Logging and PHI
 

@@ -72,6 +72,24 @@ def run_startup_safety_checks(settings: Settings) -> None:
                 "ALLOW_BLANKET_RETENTION opt-in"
             )
 
+    # Phase 8: LLM tracing (app/ops/tracing.py). Re-asserts, at startup,
+    # the same two rules app/config.py's validators already make
+    # impossible to construct a Settings instance with — defense in
+    # depth, same shape as every other re-checked-here Phase 7 rule
+    # above.
+    if settings.NOTE_TRACING_ENABLED and (
+        not settings.LANGFUSE_HOST or "cloud.langfuse.com" in settings.LANGFUSE_HOST.lower()
+    ):
+        refusals.append(
+            "NOTE_TRACING_ENABLED=true with no self-hosted LANGFUSE_HOST — "
+            "Langfuse Cloud is forbidden (would send PHI to a third party)"
+        )
+    if settings.TRACE_INCLUDE_CONTENT and (settings.PHI_MODE == "real" or settings.ENV == "prod"):
+        refusals.append(
+            "TRACE_INCLUDE_CONTENT=true with PHI_MODE=real or ENV=prod — "
+            "content-inclusive traces are for synthetic/dev debugging only"
+        )
+
     if refusals:
         for reason in refusals:
             logger.error("startup safety check failed", extra={"reason": reason})
@@ -99,5 +117,16 @@ def _log_engaged_controls(settings: Settings) -> None:
             "allow_blanket_retention": settings.ALLOW_BLANKET_RETENTION,
             "transcriber_vendor": settings.TRANSCRIBER_VENDOR,
             "note_generator_vendor": settings.NOTE_GENERATOR_VENDOR,
+            "ratelimit_enabled": settings.RATELIMIT_ENABLED,
+            "metrics_enabled": settings.METRICS_ENABLED,
+            # Truthy check, not `is not None`: an unset env var parses as
+            # "" here (same convention as OPENAI_API_KEY elsewhere), and
+            # app/api/metrics.py's own gate is also a truthy check — this
+            # must match that exactly or the banner would claim
+            # protection the route doesn't actually enforce.
+            "metrics_auth_required": bool(settings.METRICS_AUTH_TOKEN),
+            "tracing_enabled": settings.NOTE_TRACING_ENABLED,
+            "trace_include_content": settings.TRACE_INCLUDE_CONTENT,
+            "purge_dry_run": settings.PURGE_DRY_RUN,
         },
     )

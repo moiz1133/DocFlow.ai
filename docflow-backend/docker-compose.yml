@@ -1,6 +1,16 @@
+# Prometheus scrape target: GET http://<app host>:8000/metrics (Phase 8 —
+# see app/api/metrics.py). NOT exposed here as a separate port/service;
+# it rides the `app` service's existing 8000 port. In a real deployment,
+# scrape it over the internal network only — see README's "Metrics"
+# section for why it must not be reachable from the public internet.
 services:
   app:
     build: .
+    # Explicit shared tag: worker/beat below reference the SAME image
+    # (see their `image:` lines) rather than each triggering their own
+    # `docker compose build`, so `docker compose up --build` builds the
+    # app image once and reuses it for all three services.
+    image: docflow-backend-app
     env_file:
       - .env
     # Override the host-oriented DSNs from .env with the compose network's
@@ -9,8 +19,72 @@ services:
       DATABASE_URL: postgresql+asyncpg://docflow:docflow@db:5432/docflow
       APP_DATABASE_URL: postgresql+asyncpg://docflow_app:docflow_app_dev_only@db:5432/docflow
       REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
     ports:
       - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Runs generate_note_task (app/worker/tasks.py) — async SOAP note
+  # generation. Shares the `app` image and environment so it has the
+  # exact same code, Settings, and vendor selection; it is a SEPARATE
+  # process/container from `app` so it can be scaled independently
+  # (`docker compose up --scale worker=3`) without touching the web
+  # tier, and so a slow/stuck note generation can never block an HTTP
+  # request thread.
+  worker:
+    image: docflow-backend-app
+    # No `uv run` prefix: the final image's PATH already points at
+    # /app/.venv/bin (see Dockerfile) — the `uv` binary itself is only
+    # present in the builder stage, not the final runtime image.
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    # Overrides the image's inherited HEALTHCHECK (curl localhost:8000/
+    # health) — a celery worker serves no HTTP at all, so that check
+    # would just fail forever and mark this container falsely unhealthy.
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://docflow:docflow@db:5432/docflow
+      APP_DATABASE_URL: postgresql+asyncpg://docflow_app:docflow_app_dev_only@db:5432/docflow
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Schedules purge_expired_data_task (app/worker/tasks.py) on
+  # Settings.PURGE_INTERVAL — a separate long-running process from
+  # `worker` (Celery's own convention: beat only schedules, `worker`
+  # actually executes the task it enqueues), so exactly one beat
+  # instance should ever run per deployment (scaling beat itself would
+  # double-schedule the same job).
+  beat:
+    image: docflow-backend-app
+    # --schedule points beat's on-disk schedule file at /tmp: /app (the
+    # image's WORKDIR) is root-owned from the build stage and the
+    # `docflow` user (see Dockerfile's USER) has no write access there.
+    command: celery -A app.worker.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://docflow:docflow@db:5432/docflow
+      APP_DATABASE_URL: postgresql+asyncpg://docflow_app:docflow_app_dev_only@db:5432/docflow
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
     depends_on:
       db:
         condition: service_healthy

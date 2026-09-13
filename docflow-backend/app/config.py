@@ -23,6 +23,15 @@ def _split_csv(value: object) -> object:
     return value
 
 
+def _with_redis_db(url: str, db: int) -> str:
+    """Swap a redis:// URL's trailing /<db> segment. Used to default
+    CELERY_BROKER_URL/CELERY_RESULT_BACKEND off of REDIS_URL without a
+    deployer having to spell out near-identical DSNs three times.
+    """
+    base, _, _ = url.rpartition("/")
+    return f"{base}/{db}"
+
+
 class Settings(BaseSettings):
     """Environment-driven application configuration."""
 
@@ -177,6 +186,73 @@ class Settings(BaseSettings):
     # (ConsentService) and at startup (app/security/startup_checks.py).
     ALLOW_BLANKET_RETENTION: bool = False
 
+    # --- Phase 8: rate limiting, metrics, tracing, async workers --------
+
+    # Central Redis-backed limiter — see app/ops/ratelimit.py. Per-bucket
+    # limits below have lenient defaults on purpose (the point of Phase 8
+    # is that the hook exists and is load-bearing everywhere it should be;
+    # tightening any one bucket later is a config change, not new
+    # plumbing). Limits are enforced in Redis, which every app-server
+    # instance shares, so they hold across a horizontally-scaled
+    # deployment, not just within one process.
+    RATELIMIT_ENABLED: bool = True
+    RATELIMIT_LOGIN_LIMIT: int = 10
+    RATELIMIT_LOGIN_WINDOW_SECONDS: int = 60
+    RATELIMIT_REFRESH_LIMIT: int = 20
+    RATELIMIT_REFRESH_WINDOW_SECONDS: int = 60
+    RATELIMIT_SESSION_CREATE_LIMIT: int = 30
+    RATELIMIT_SESSION_CREATE_WINDOW_SECONDS: int = 60
+    RATELIMIT_NOTE_GENERATE_LIMIT: int = 20
+    RATELIMIT_NOTE_GENERATE_WINDOW_SECONDS: int = 60
+    RATELIMIT_WS_CONNECT_LIMIT: int = 10
+    RATELIMIT_WS_CONNECT_WINDOW_SECONDS: int = 60
+    # Looser bucket for plain reads (GET .../{id}, GET .../note).
+    RATELIMIT_READ_LIMIT: int = 300
+    RATELIMIT_READ_WINDOW_SECONDS: int = 60
+
+    # GET /metrics (app/api/metrics.py) — Prometheus scrape target. Not
+    # meant to be public: METRICS_AUTH_TOKEN, when set, requires a
+    # matching `Authorization: Bearer <token>` header; when unset, the
+    # endpoint relies entirely on network policy (an internal-only
+    # ingress/firewall rule) to keep it off the public internet — see
+    # README.
+    METRICS_ENABLED: bool = True
+    METRICS_AUTH_TOKEN: str | None = None
+
+    # LANGFUSE_PUBLIC_KEY/SECRET_KEY are only needed when NOTE_TRACING_ENABLED
+    # is true (see _validate_tracing_is_self_hosted above, which already
+    # enforces LANGFUSE_HOST can't be Langfuse Cloud). TRACE_INCLUDE_CONTENT
+    # additionally gates whether transcript/note TEXT (not just metadata)
+    # is attached to a trace — refused outright under PHI_MODE=real or
+    # ENV=prod (see _validate_trace_content_restricted below and
+    # app/security/startup_checks.py's re-assertion of the same rule) since
+    # even a self-hosted Langfuse instance is a third system PHI would be
+    # copied into.
+    LANGFUSE_PUBLIC_KEY: str | None = None
+    LANGFUSE_SECRET_KEY: str | None = None
+    TRACE_INCLUDE_CONTENT: bool = False
+
+    # Celery broker/result backend — separate Redis DB (db 1) from
+    # REDIS_URL's default (db 0, used for rate limiting/health checks) so
+    # task traffic and rate-limit counters never share keyspace. Both
+    # default to REDIS_URL with the db segment swapped, so a bare
+    # docker-compose checkout works with zero extra config; override
+    # explicitly for a dedicated broker/backend in a real deployment.
+    CELERY_BROKER_URL: str | None = None
+    CELERY_RESULT_BACKEND: str | None = None
+
+    # Retention-purge job (app/worker/tasks.py) — the scheduled sweep that
+    # makes "zero/consented retention" true over time, not just at write
+    # time. Durations are simple "<int><unit>" strings (s/m/h/d) parsed by
+    # app/ops/durations.py. PURGE_DRY_RUN defaults True: a deployer must
+    # explicitly opt into actual deletion after confirming dry-run output
+    # looks right, same "opt-in to the dangerous behavior" shape as
+    # ALLOW_BLANKET_RETENTION above.
+    PURGE_UNRETAINED_AFTER: str = "24h"
+    PURGE_ORPHAN_SESSION_AFTER: str = "24h"
+    PURGE_INTERVAL: str = "1h"
+    PURGE_DRY_RUN: bool = True
+
     @field_validator("CORS_WEB_ORIGINS", "CORS_EXTENSION_ORIGINS", mode="before")
     @classmethod
     def _parse_csv_origins(cls, value: object) -> object:
@@ -209,6 +285,35 @@ class Settings(BaseSettings):
                     "never Langfuse Cloud — tracing would otherwise send PHI "
                     "(transcript/note text) to a third party"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_trace_content_restricted(self) -> "Settings":
+        # Re-checked independently by app/security/startup_checks.py (same
+        # defense-in-depth shape as every other Phase 7/8 control) — this
+        # validator makes a bad combination impossible to even construct a
+        # Settings instance with; the startup check catches it too in case
+        # a future refactor ever lets Settings be built without going
+        # through this validator (e.g. model_construct).
+        if self.TRACE_INCLUDE_CONTENT and (self.PHI_MODE == "real" or self.ENV == "prod"):
+            raise ValueError(
+                "TRACE_INCLUDE_CONTENT must be false when PHI_MODE=real or ENV=prod — "
+                "content-inclusive traces (transcript/note TEXT, not just metadata) "
+                "are for synthetic/dev prompt debugging only, never where real PHI "
+                "could exist"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _default_celery_urls(self) -> "Settings":
+        # Separate Redis logical DBs (1 for broker, 2 for result backend)
+        # from REDIS_URL's own db (0, used by rate limiting/health checks)
+        # so Celery's traffic never shares keyspace with either — see the
+        # field comments above.
+        if self.CELERY_BROKER_URL is None:
+            self.CELERY_BROKER_URL = _with_redis_db(self.REDIS_URL, 1)
+        if self.CELERY_RESULT_BACKEND is None:
+            self.CELERY_RESULT_BACKEND = _with_redis_db(self.REDIS_URL, 2)
         return self
 
 

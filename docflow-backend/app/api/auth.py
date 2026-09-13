@@ -28,7 +28,6 @@ from app.auth.dependencies import (
 )
 from app.auth.mfa import generate_totp_secret, provisioning_uri, verify_totp_code
 from app.auth.passwords import hash_password, verify_password
-from app.auth.rate_limit import RateLimiter
 from app.auth.refresh_store import (
     RefreshTokenError,
     RefreshTokenReuseDetected,
@@ -51,6 +50,7 @@ from app.config import get_settings
 from app.db.session import get_admin_sessionmaker, get_session, get_sessionmaker, set_tenant
 from app.models import Practice, User
 from app.models.enums import AuditAction, UserRole
+from app.ops.ratelimit import IpRateLimiter
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 
@@ -193,7 +193,7 @@ async def register(
     return TokenPairResponse(access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/login", dependencies=[Depends(RateLimiter("login"))])
+@router.post("/login", dependencies=[Depends(IpRateLimiter("login"))])
 async def login(body: LoginRequest, request: Request) -> LoginResponse:
     user = await _find_user_by_email(body.email)
 
@@ -360,7 +360,7 @@ async def mfa_verify(
     raise unauthorized_error("Invalid or expired token")
 
 
-@router.post("/refresh", dependencies=[Depends(RateLimiter("refresh"))])
+@router.post("/refresh", dependencies=[Depends(IpRateLimiter("refresh"))])
 async def refresh(
     body: RefreshRequest,
     request: Request,

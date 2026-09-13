@@ -19,6 +19,10 @@ dependencies = [
     "openai>=1.50.0",
     "python-multipart>=0.0.12",
     "cryptography>=43.0.0",
+    "celery>=5.4.0",
+    "prometheus-client>=0.21.0",
+    "langfuse>=2.53.0",
+    "nest-asyncio>=1.6.0",
 ]
 
 [dependency-groups]
@@ -122,6 +126,19 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "alembic.versions.*"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+# celery ships no inline types and no stub package is installed — see
+# app/worker/celery_app.py and app/worker/tasks.py.
+module = "celery.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# nest_asyncio ships no inline types — see app/worker/tasks.py's
+# _run_async, which lazily imports it only for the eager-mode-under-
+# pytest branch (never exercised by a real Celery worker process).
+module = "nest_asyncio"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

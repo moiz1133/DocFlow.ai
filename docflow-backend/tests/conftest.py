@@ -191,6 +191,22 @@ async def two_practices(
     return result
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _celery_eager_mode() -> None:
+    """Runs every Celery task inline, synchronously, in the calling
+    process — no live worker needed for tests (see app/worker/tasks.py
+    and the "vendors=mock, eager Celery" convention this test suite
+    follows throughout). task_eager_propagates=True makes an eagerly-run
+    task's exception raise directly at the .delay()/.apply() call site
+    instead of only being visible via the AsyncResult, which is what
+    tests asserting on a failure path expect.
+    """
+    from app.worker.celery_app import celery_app
+
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_eager_propagates = True
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _flush_rate_limit_keys() -> AsyncIterator[None]:
     """Rate-limit counters are keyed by (action, client IP), and every

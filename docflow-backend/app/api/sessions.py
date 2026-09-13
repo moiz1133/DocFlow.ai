@@ -41,9 +41,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_user, get_tenant_session
 from app.auth.tokens import AccessTokenClaims, TokenError, decode_access_token
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.models import EncounterSession, Transcript, User
 from app.models.enums import AuditAction, SessionStatus
+from app.ops.metrics import (
+    TRANSCRIPTION_LATENCY_SECONDS,
+    WS_ACTIVE_CONNECTIONS,
+    WS_SESSION_DURATION_SECONDS,
+)
+from app.ops.ratelimit import UserRateLimiter, check_rate_limit
 from app.services.transcription_service import (
     SessionLimitExceeded,
     StreamAggregate,
@@ -74,6 +80,10 @@ router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 _CLOSE_UNAUTHORIZED = 4401
 _CLOSE_NOT_FOUND = 4404
 _CLOSE_LIMIT_EXCEEDED = 4413
+# Phase 8: too many concurrent/recent stream connection attempts for this
+# user — mirrors HTTP 429 in the app-defined WS close-code range, same as
+# the other _CLOSE_* codes above.
+_CLOSE_RATE_LIMITED = 4429
 
 
 # --- Schemas ---------------------------------------------------------------
@@ -119,7 +129,11 @@ class _StartMessage(BaseModel):
 # --- REST routes -------------------------------------------------------------
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(UserRateLimiter("session_create"))],
+)
 async def create_session(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_tenant_session)],
@@ -138,7 +152,7 @@ async def create_session(
     return CreateSessionResponse(session_id=encounter.id)
 
 
-@router.get("/{session_id}")
+@router.get("/{session_id}", dependencies=[Depends(UserRateLimiter("read"))])
 async def get_session(
     session_id: uuid.UUID,
     user: Annotated[User, Depends(get_current_user)],
@@ -193,9 +207,13 @@ async def finalize_session(
     chunk = AudioChunk(data=audio_bytes, mime_type=audio.content_type or "application/octet-stream")
     transcriber = get_transcriber()
 
+    transcribe_started_at = time.monotonic()
     try:
         result = await transcriber.transcribe([chunk])
     except TranscriptionError as exc:
+        TRANSCRIPTION_LATENCY_SECONDS.labels(
+            provider=transcriber.provider_name, outcome="error"
+        ).observe(time.monotonic() - transcribe_started_at)
         await set_session_status(db, encounter, SessionStatus.error)
         await record_ingestion_event(
             db,
@@ -208,6 +226,9 @@ async def finalize_session(
         )
         raise HTTPException(http_status_for(exc), "Transcription failed") from exc
 
+    TRANSCRIPTION_LATENCY_SECONDS.labels(
+        provider=transcriber.provider_name, outcome="success"
+    ).observe(time.monotonic() - transcribe_started_at)
     await set_session_status(db, encounter, SessionStatus.transcribing)
     transcript = await persist_transcript(
         db,
@@ -355,6 +376,12 @@ async def _await_start_message(websocket: WebSocket) -> _StartMessage | None:
 
 @router.websocket("/{session_id}/stream")
 async def stream_session(websocket: WebSocket, session_id: uuid.UUID) -> None:
+    """Transport/auth/rate-limit shell around _run_stream, which does the
+    actual work and returns a PHI-free outcome label. Kept as a thin
+    wrapper so WS_ACTIVE_CONNECTIONS/WS_SESSION_DURATION_SECONDS (Phase 8)
+    are tracked in exactly one place regardless of which of _run_stream's
+    several return points fires.
+    """
     settings = get_settings()
     await websocket.accept()
 
@@ -362,6 +389,33 @@ async def stream_session(websocket: WebSocket, session_id: uuid.UUID) -> None:
     if claims is None:
         return
 
+    # Phase 8: limits NEW CONNECTION ESTABLISHMENT per user, not audio
+    # frames within an already-open connection — a client that opens many
+    # concurrent/rapid /stream connections is throttled here, once, before
+    # any audio is ever accepted.
+    rate_limit_result = await check_rate_limit(
+        bucket="ws_connect", subject=f"user:{claims.user_id}", settings=settings
+    )
+    if not rate_limit_result.allowed:
+        await _send_error(websocket, code="rate_limited", message="Too many connection attempts")
+        await _close_ws(websocket, code=_CLOSE_RATE_LIMITED)
+        return
+
+    WS_ACTIVE_CONNECTIONS.inc()
+    ws_started_at = time.monotonic()
+    outcome = "error"
+    try:
+        outcome = await _run_stream(websocket, session_id, claims, settings)
+    finally:
+        WS_ACTIVE_CONNECTIONS.dec()
+        WS_SESSION_DURATION_SECONDS.labels(outcome=outcome).observe(
+            time.monotonic() - ws_started_at
+        )
+
+
+async def _run_stream(
+    websocket: WebSocket, session_id: uuid.UUID, claims: AccessTokenClaims, settings: Settings
+) -> str:
     async with tenant_session(claims.practice_id) as db:
         encounter = await db.get(EncounterSession, session_id)
         session_status = encounter.status if encounter is not None else None
@@ -369,7 +423,7 @@ async def stream_session(websocket: WebSocket, session_id: uuid.UUID) -> None:
     if encounter is None or session_status is None:
         await _send_error(websocket, code="session_not_found", message="Session not found")
         await _close_ws(websocket, code=_CLOSE_NOT_FOUND)
-        return
+        return "session_not_found"
 
     await _send_status(websocket, session_status)
 
@@ -381,13 +435,13 @@ async def stream_session(websocket: WebSocket, session_id: uuid.UUID) -> None:
             encounter = await db.get(EncounterSession, session_id)
             if encounter is not None:
                 await set_session_status(db, encounter, SessionStatus.error)
-        return
+        return "no_start_message"
 
     async with tenant_session(claims.practice_id) as db:
         encounter = await db.get(EncounterSession, session_id)
         if encounter is None:
             await _close_ws(websocket, code=_CLOSE_NOT_FOUND)
-            return
+            return "session_not_found"
         await set_session_status(db, encounter, SessionStatus.recording)
         await record_ingestion_event(
             db,
@@ -487,7 +541,7 @@ async def stream_session(websocket: WebSocket, session_id: uuid.UUID) -> None:
             if encounter is not None:
                 await set_session_status(db, encounter, SessionStatus.error)
         await _close_ws(websocket, code=_CLOSE_LIMIT_EXCEEDED)
-        return
+        return "limit_exceeded"
 
     if transcription_error is not None:
         code = error_code_for(transcription_error)
@@ -506,18 +560,18 @@ async def stream_session(websocket: WebSocket, session_id: uuid.UUID) -> None:
                     metadata={"status": "error", "reason": code},
                 )
         await _close_ws(websocket, code=1011)
-        return
+        return "transcription_error"
 
     async with tenant_session(claims.practice_id) as db:
         encounter = await db.get(EncounterSession, session_id)
         if encounter is None:
             await _close_ws(websocket, code=_CLOSE_NOT_FOUND)
-            return
+            return "session_not_found"
 
         if receive_state.ended_via == "disconnect" and not receive_state.any_audio_received:
             await set_session_status(db, encounter, SessionStatus.error)
             await _close_ws(websocket, code=1000)
-            return
+            return "disconnect_no_audio"
 
         await set_session_status(db, encounter, SessionStatus.transcribing)
         result = aggregate.to_result(provider=transcriber.provider_name)
@@ -534,3 +588,4 @@ async def stream_session(websocket: WebSocket, session_id: uuid.UUID) -> None:
 
     await _send_status(websocket, SessionStatus.complete)
     await _close_ws(websocket, code=1000)
+    return "success"
