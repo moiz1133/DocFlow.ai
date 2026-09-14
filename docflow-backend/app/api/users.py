@@ -13,9 +13,10 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.errors import FORBIDDEN, NOT_FOUND, UNAUTHORIZED, merge_responses
 from app.auth.dependencies import get_tenant_session, require_role
 from app.models import User
 from app.models.enums import UserRole
@@ -27,12 +28,16 @@ _require_owner = require_role(UserRole.owner)
 
 class UserSummaryResponse(BaseModel):
     id: uuid.UUID
-    email: str
-    full_name: str
+    email: str = Field(examples=["colleague@example-clinic.test"])
+    full_name: str = Field(examples=["Dr. Jamie Rivera"])
     role: UserRole
 
 
-@router.get("/{user_id}")
+@router.get(
+    "/{user_id}",
+    responses=merge_responses(UNAUTHORIZED, FORBIDDEN, NOT_FOUND),
+    summary="Look up a colleague in the caller's own practice (owner-only)",
+)
 async def get_user(
     user_id: uuid.UUID,
     caller: Annotated[User, Depends(_require_owner)],

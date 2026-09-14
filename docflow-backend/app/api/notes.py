@@ -28,10 +28,11 @@ import uuid
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.errors import CONFLICT, NOT_FOUND, RATE_LIMITED, UNAUTHORIZED, merge_responses
 from app.auth.dependencies import get_current_user, get_tenant_session
 from app.models import EncounterSession, Note, Transcript, User
 from app.models.enums import NoteStatus, SessionStatus
@@ -44,6 +45,40 @@ router = APIRouter(prefix="/v1/sessions", tags=["notes"])
 
 
 class NoteOut(BaseModel):
+    # Example note text below matches app/notes/mock.py's own synthetic
+    # fixture (a fabricated headache/fatigue/dehydration visit) verbatim
+    # — grounded in what the mock vendor actually returns, never real
+    # patient content.
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": "5f2c9e2a-1e3b-4c5a-9f7e-2b6d7a8c9e1f",
+                    "status": "draft",
+                    "subjective": (
+                        "Patient reports a mild headache and fatigue for approximately "
+                        "three days. Denies fever, nausea, or vision changes."
+                    ),
+                    "objective": "Blood pressure check performed at this visit.",
+                    "assessment": "Likely tension-type headache secondary to poor sleep hygiene.",
+                    "plan": "Advised increased water intake and improved sleep hygiene.",
+                    "full_text": (
+                        "Subjective: Patient reports a mild headache and fatigue...\n\n"
+                        "Objective: Blood pressure check performed at this visit.\n\n"
+                        "Assessment: Likely tension-type headache...\n\nPlan: Advised "
+                        "increased water intake and improved sleep hygiene."
+                    ),
+                    "provider": "mock",
+                    "model": None,
+                    "prompt_version": "soap_primary_care_v1",
+                    "version": 1,
+                    "degraded": False,
+                    "is_retained": True,
+                }
+            ]
+        }
+    )
+
     id: uuid.UUID
     status: NoteStatus
     subjective: str | None
@@ -104,6 +139,8 @@ def _note_out(note: Note) -> NoteOut:
     "/{session_id}/note",
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(UserRateLimiter("note_generate"))],
+    responses=merge_responses(UNAUTHORIZED, NOT_FOUND, CONFLICT, RATE_LIMITED),
+    summary="Enqueue SOAP note generation for a session with a completed transcript",
 )
 async def generate_note(
     session_id: uuid.UUID,
@@ -145,7 +182,12 @@ async def generate_note(
     return GenerateNoteAcceptedResponse(task_id=task.id)
 
 
-@router.get("/{session_id}/note", dependencies=[Depends(UserRateLimiter("read"))])
+@router.get(
+    "/{session_id}/note",
+    dependencies=[Depends(UserRateLimiter("read"))],
+    responses=merge_responses(UNAUTHORIZED, NOT_FOUND, RATE_LIMITED),
+    summary="Poll note-generation status and, once ready, the draft note",
+)
 async def get_note_status(
     session_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_tenant_session)],

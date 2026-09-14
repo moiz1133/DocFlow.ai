@@ -51,7 +51,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
-    app = FastAPI(title="DocFlow.ai Backend", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="DocFlow.ai Backend",
+        # Phase 9: /v1 is now a frozen contract (see README's "/v1 API
+        # contract" section and contracts/openapi.v1.json, the committed
+        # snapshot tests/test_openapi_contract.py guards against
+        # unreviewed drift). Bump this on any breaking change to the /v1
+        # surface — which should instead almost always mean cutting /v2,
+        # not changing /v1's behavior out from under existing clients.
+        version="1.0.0",
+        description=(
+            "DocFlow.ai backend — an ambient AI medical scribe. The /v1 "
+            "REST surface and its WebSocket streaming protocol "
+            "(documented separately at contracts/ws-protocol.v1.md, "
+            "since OpenAPI cannot describe WebSocket messages) are a "
+            "frozen contract: breaking changes land in /v2, never as an "
+            "in-place change to /v1."
+        ),
+        lifespan=lifespan,
+    )
 
     settings = get_settings()
     origins = [*settings.CORS_WEB_ORIGINS, *settings.CORS_EXTENSION_ORIGINS]
