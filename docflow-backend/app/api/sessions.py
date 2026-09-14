@@ -35,10 +35,27 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.websockets import WebSocket, WebSocketState
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.errors import (
+    BAD_REQUEST,
+    NOT_FOUND,
+    PAYLOAD_TOO_LARGE,
+    RATE_LIMITED,
+    UNAUTHORIZED,
+    UPSTREAM_VENDOR_FAILURE,
+    merge_responses,
+)
+from app.api.ws_messages import (
+    TranscriptSegmentOut,
+    WSErrorEvent,
+    WSSessionStatusEvent,
+    WSStartMessage,
+    WSTranscriptFinalEvent,
+    WSTranscriptPartialEvent,
+)
 from app.auth.dependencies import get_current_user, get_tenant_session
 from app.auth.tokens import AccessTokenClaims, TokenError, decode_access_token
 from app.config import Settings, get_settings
@@ -99,31 +116,14 @@ class SessionStatusResponse(BaseModel):
     transcript_exists: bool
 
 
-class TranscriptSegmentOut(BaseModel):
-    speaker: str | None
-    start: float | None
-    end: float | None
-    text: str
-
-
 class TranscriptOut(BaseModel):
-    content: str
+    content: str = Field(examples=["Patient reports mild headache since yesterday."])
     segments: list[TranscriptSegmentOut]
     is_retained: bool
 
 
 class FinalizeResponse(BaseModel):
     transcript: TranscriptOut
-
-
-class _AudioFormat(BaseModel):
-    mime: str
-    sample_rate: int | None = None
-
-
-class _StartMessage(BaseModel):
-    type: Literal["start"]
-    format: _AudioFormat
 
 
 # --- REST routes -------------------------------------------------------------
@@ -133,6 +133,8 @@ class _StartMessage(BaseModel):
     "",
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(UserRateLimiter("session_create"))],
+    responses=merge_responses(UNAUTHORIZED, RATE_LIMITED),
+    summary="Start a new encounter session",
 )
 async def create_session(
     user: Annotated[User, Depends(get_current_user)],
@@ -152,7 +154,12 @@ async def create_session(
     return CreateSessionResponse(session_id=encounter.id)
 
 
-@router.get("/{session_id}", dependencies=[Depends(UserRateLimiter("read"))])
+@router.get(
+    "/{session_id}",
+    dependencies=[Depends(UserRateLimiter("read"))],
+    responses=merge_responses(UNAUTHORIZED, NOT_FOUND, RATE_LIMITED),
+    summary="Get a session's current status",
+)
 async def get_session(
     session_id: uuid.UUID,
     user: Annotated[User, Depends(get_current_user)],
@@ -176,7 +183,13 @@ async def get_session(
     )
 
 
-@router.post("/{session_id}/finalize")
+@router.post(
+    "/{session_id}/finalize",
+    responses=merge_responses(
+        UNAUTHORIZED, NOT_FOUND, BAD_REQUEST, PAYLOAD_TOO_LARGE, UPSTREAM_VENDOR_FAILURE
+    ),
+    summary="Non-streaming fallback: submit a complete recording and get back its transcript",
+)
 async def finalize_session(
     session_id: uuid.UUID,
     user: Annotated[User, Depends(get_current_user)],
@@ -283,16 +296,22 @@ async def _send_json_safe(websocket: WebSocket, payload: dict[str, object]) -> N
 
 
 async def _send_status(websocket: WebSocket, session_status: SessionStatus) -> None:
-    await _send_json_safe(websocket, {"type": "session.status", "status": session_status.value})
+    await _send_json_safe(
+        websocket, WSSessionStatusEvent(status=session_status.value).model_dump(mode="json")
+    )
 
 
 async def _send_error(websocket: WebSocket, *, code: str, message: str) -> None:
-    await _send_json_safe(websocket, {"type": "error", "code": code, "message": message})
+    await _send_json_safe(
+        websocket, WSErrorEvent(code=code, message=message).model_dump(mode="json")
+    )
 
 
 async def _send_transcript_event(websocket: WebSocket, event: TranscriptionEvent) -> None:
     if event.type == "partial":
-        await _send_json_safe(websocket, {"type": "transcript.partial", "text": event.text})
+        await _send_json_safe(
+            websocket, WSTranscriptPartialEvent(text=event.text).model_dump(mode="json")
+        )
         return
     # Mirrors StreamAggregate.add_final_event's own fallback (see
     # app/services/transcription_service.py) so what the client sees
@@ -300,12 +319,13 @@ async def _send_transcript_event(websocket: WebSocket, event: TranscriptionEvent
     # supplied segment (MockTranscriber never sets one) still gets a
     # synthesized one here rather than reporting empty segments for
     # non-empty text.
-    segments: list[dict[str, object]] = []
+    segments: list[TranscriptSegmentOut] = []
     if event.text:
         segment = event.segment or TranscriptSegment(text=event.text)
-        segments = [segment.to_jsonb()]
+        segments = [TranscriptSegmentOut(**segment.to_jsonb())]
     await _send_json_safe(
-        websocket, {"type": "transcript.final", "text": event.text, "segments": segments}
+        websocket,
+        WSTranscriptFinalEvent(text=event.text, segments=segments).model_dump(mode="json"),
     )
 
 
@@ -347,7 +367,7 @@ async def _authenticate_ws(websocket: WebSocket) -> AccessTokenClaims | None:
     return claims
 
 
-async def _await_start_message(websocket: WebSocket) -> _StartMessage | None:
+async def _await_start_message(websocket: WebSocket) -> WSStartMessage | None:
     """Blocks for the client's first message, which must be a JSON
     {"type": "start", "format": {...}} control frame. Sends an error and
     closes on anything else (disconnect, binary-before-start, malformed
@@ -367,7 +387,7 @@ async def _await_start_message(websocket: WebSocket) -> _StartMessage | None:
         return None
 
     try:
-        return _StartMessage.model_validate(control)
+        return WSStartMessage.model_validate(control)
     except ValidationError:
         await _send_error(websocket, code="protocol_error", message="Malformed start message")
         await _close_ws(websocket, code=1002)

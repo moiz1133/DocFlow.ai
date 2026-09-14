@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.errors import BAD_REQUEST, CONFLICT, RATE_LIMITED, UNAUTHORIZED, merge_responses
 from app.auth.audit import record_auth_event
 from app.auth.dependencies import (
     get_bearer_token,
@@ -61,10 +62,10 @@ _GENERIC_LOGIN_ERROR = "Invalid email or password"
 
 
 class RegisterRequest(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=8, max_length=256)
-    full_name: str = Field(min_length=1, max_length=255)
-    practice_name: str = Field(min_length=1, max_length=255)
+    email: EmailStr = Field(examples=["owner@example-clinic.test"])
+    password: str = Field(min_length=8, max_length=256, examples=["correct horse battery staple"])
+    full_name: str = Field(min_length=1, max_length=255, examples=["Dr. Jamie Rivera"])
+    practice_name: str = Field(min_length=1, max_length=255, examples=["Example Family Clinic"])
 
 
 class TokenPairResponse(BaseModel):
@@ -74,8 +75,8 @@ class TokenPairResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
+    email: EmailStr = Field(examples=["owner@example-clinic.test"])
+    password: str = Field(examples=["correct horse battery staple"])
 
 
 class LoginResponse(BaseModel):
@@ -145,7 +146,12 @@ async def _find_user_by_email(email: str) -> User | None:
 # --- Routes ----------------------------------------------------------------
 
 
-@router.post("/register", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    status_code=status.HTTP_201_CREATED,
+    responses=merge_responses(CONFLICT),
+    summary="Register a new practice and its first (owner) user",
+)
 async def register(
     body: RegisterRequest,
     request: Request,
@@ -193,7 +199,12 @@ async def register(
     return TokenPairResponse(access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/login", dependencies=[Depends(IpRateLimiter("login"))])
+@router.post(
+    "/login",
+    dependencies=[Depends(IpRateLimiter("login"))],
+    responses=merge_responses(UNAUTHORIZED, RATE_LIMITED),
+    summary="Password login — returns tokens, or an MFA-pending token if MFA is enabled",
+)
 async def login(body: LoginRequest, request: Request) -> LoginResponse:
     user = await _find_user_by_email(body.email)
 
@@ -256,7 +267,7 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
     return LoginResponse(mfa_required=False, access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/mfa/setup")
+@router.post("/mfa/setup", responses=merge_responses(UNAUTHORIZED), summary="Begin MFA enrollment")
 async def mfa_setup(
     user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_tenant_session)],
@@ -271,7 +282,11 @@ async def mfa_setup(
     return MfaSetupResponse(secret=secret, provisioning_uri=provisioning_uri(secret, user.email))
 
 
-@router.post("/mfa/verify")
+@router.post(
+    "/mfa/verify",
+    responses=merge_responses(UNAUTHORIZED, BAD_REQUEST),
+    summary="Confirm MFA enrollment, or complete a login that required MFA",
+)
 async def mfa_verify(
     body: MfaVerifyRequest,
     request: Request,
@@ -360,7 +375,12 @@ async def mfa_verify(
     raise unauthorized_error("Invalid or expired token")
 
 
-@router.post("/refresh", dependencies=[Depends(IpRateLimiter("refresh"))])
+@router.post(
+    "/refresh",
+    dependencies=[Depends(IpRateLimiter("refresh"))],
+    responses=merge_responses(UNAUTHORIZED, RATE_LIMITED),
+    summary="Rotate a refresh token for a fresh access+refresh pair",
+)
 async def refresh(
     body: RefreshRequest,
     request: Request,
@@ -407,7 +427,11 @@ async def refresh(
     return RefreshResponse(access_token=new_access_token, refresh_token=new_refresh_token)
 
 
-@router.post("/logout")
+@router.post(
+    "/logout",
+    responses=merge_responses(UNAUTHORIZED, BAD_REQUEST),
+    summary="Revoke a refresh token",
+)
 async def logout(
     body: LogoutRequest,
     request: Request,
@@ -434,7 +458,9 @@ async def logout(
     return LogoutResponse()
 
 
-@router.get("/me")
+@router.get(
+    "/me", responses=merge_responses(UNAUTHORIZED), summary="The current authenticated user"
+)
 async def me(user: Annotated[User, Depends(get_current_user)]) -> MeResponse:
     return MeResponse(
         id=user.id,
